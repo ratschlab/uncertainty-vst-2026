@@ -1,0 +1,1730 @@
+# snake/Snakefile
+#
+# The sweep. Every experiment of the study is one job here, and every parameter that
+# distinguishes two jobs is a directory level in the output path, so the path IS the index:
+#
+#   results/{dataset}/{run_id_classic}/{gene_set}/r{NN}/{model_type}/[lambda_{lam}/]
+#
+# Reading order, top to bottom:
+#   1. gene-set resolution      which genes a (dataset, gene_set) names, read at job time
+#   2. target enumeration       _classic_targets / _gcm_targets / the ensemble variants turn
+#                               the config's sweep axes into the file list each `all_*` asks for
+#   3. resource sizing          time and memory scale with the gene count (_n_genes_for)
+#   4. the rules                preprocess, the three training rules, then the post-hoc chain
+#
+# Entry points (`snakemake ... <target>`), each a rule with inputs only:
+#   all_preprocess               the shared preprocessed adata, per (dataset, preproc_id, radius)
+#   all_classic                  the classic sweep: one multi-output MLP per gene set
+#   all_gcm                      the gene-conditioned sweep
+#   all                          both sweeps
+#   all_ensemble_classic         the deep ensemble: members, then g* -> combine -> the channels
+#   all_train_ensemble_classic   its members alone, without the post-hoc chain
+#
+# Three training rules rather than one because the model types differ in what they sweep:
+# train_mse (no variance head), train_gaussian (carries a lambda_ path segment), and
+# train_lam_free_prob (a predictive distribution, no lambda). A model type is routed by its
+# KIND, declared in src/models/specs.py, so adding one does not touch this file.
+#
+# Cluster submission is not spelled out here: snake/profile/config.yaml holds the submit
+# command, so it is not repeated on the command line.
+
+configfile: "snake/config/config.yaml"
+
+import os
+import subprocess
+
+# Resolve the conda profile script here, on the submitting host, so the prefix below holds a
+# plain path: Snakemake formats the shell prefix, so a ${...} brace in it is read as a
+# wildcard. Set CONDA_SH to override the autodetection.
+CONDA_SH = os.environ.get("CONDA_SH") or os.path.join(
+    subprocess.run(["conda", "info", "--base"], capture_output=True, text=True,
+                   check=True).stdout.strip(),
+    "etc/profile.d/conda.sh",
+)
+if not os.path.isfile(CONDA_SH):
+    raise FileNotFoundError(f"conda.sh not found at {CONDA_SH}; set CONDA_SH to the conda profile script")
+
+CONDA_ACTIVATE = f'source "{CONDA_SH}" && conda activate mtenv0'
+
+# The rules below pipe training output through `tee` to log it. tee exits 0 even when the
+# training command fails, so without pipefail the shell returns 0 and the failure is
+# hidden from Snakemake.
+shell.prefix(CONDA_ACTIVATE + " && set -o pipefail && ")
+
+
+# -- Per-dataset gene set resolution -------------------------------------------
+# Each datasets.{ds} block has its own gene_sets, so datasets can use different panels.
+
+def _read_gene_list(path):
+    """Read a one-gene-per-line file, ignoring blanks and `#` comments.
+
+    Gene lists are read at job-execution time, not at Snakefile parse time. A gene_set can
+    therefore point at a preprocessing output, such as an hvg_top{N}.txt file under
+    _preprocessed/, that does not exist yet when `all_preprocess` runs.
+    """
+    if not os.path.isabs(path):
+        path = os.path.join(config["project_root"], path)
+    try:
+        with open(path) as f:
+            return [ln.strip() for ln in f
+                    if ln.strip() and not ln.strip().startswith("#")]
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"gene list file not found at job time: {path}. "
+            f"If this is a preprocessing output (e.g. an HVG list under "
+            f"_preprocessed/), run `all_preprocess` for this dataset/radius first."
+        )
+
+
+# Gene-set ids per dataset. No file is read here: the ids alone build the targets and wildcard constraints. 
+GENE_SET_SPECS_BY_DS = {
+    ds: dict(config["datasets"][ds].get("gene_sets") or {})
+    for ds in config["dataset_values"]
+}
+
+# Resolved gene LISTS, filled the first time a job asks for one (lazy file read).
+_GENE_SETS_CACHE = {}
+
+
+def _genes_for(dataset, gene_set):
+    """Resolve a (dataset, gene_set) to a gene list, or to the string 'all'.
+
+    Reads any ".txt" gene-list file on first use and caches it. The only two callers are
+    get_genes_csv, a params value evaluated when a job runs, and _n_genes_for, a resources
+    value evaluated at scheduling. Nothing calls this at parse time, so a gene_set that
+    points at an HVG output file forces that file to exist only once a training job needs
+    it, not when you run all_preprocess.
+
+    A pairing that crosses datasets raises a KeyError here. A missing file raises
+    FileNotFoundError, which only _n_genes_for catches, see its resource fallback.
+    """
+    if (dataset, gene_set) in _GENE_SETS_CACHE:
+        return _GENE_SETS_CACHE[(dataset, gene_set)]
+    ds_sets = GENE_SET_SPECS_BY_DS.get(dataset)
+    if ds_sets is None:
+        raise KeyError(
+            f"dataset '{dataset}' is not in dataset_values; "
+            f"known: {list(GENE_SET_SPECS_BY_DS)}"
+        )
+    if gene_set not in ds_sets:
+        raise KeyError(
+            f"gene_set '{gene_set}' is not defined for dataset '{dataset}'. "
+            f"This usually means a target crossed datasets. "
+            f"'{dataset}' defines: {sorted(ds_sets)}"
+        )
+    value = ds_sets[gene_set]
+    if isinstance(value, str) and value != "all" and value.endswith(".txt"):
+        genes = _read_gene_list(value.format(preproc_id=config["preproc_id"]))
+    else:
+        genes = value                          # inline list or "all"
+    _GENE_SETS_CACHE[(dataset, gene_set)] = genes
+    return genes
+
+
+def get_genes_csv(wildcards):
+    """Return comma-separated gene list, or 'all' for every gene saved by preprocess."""
+    genes = _genes_for(wildcards.dataset, wildcards.gene_set)
+    if genes == "all":
+        return "all"
+    return ",".join(sorted(genes))
+
+
+# Pin {dataset} and {gene_set} to real names; an unpinned wildcard matches any segment.
+# The gene_set list is one union over datasets, so a wrong pairing fails later in _genes_for.
+_all_gene_set_names = sorted({
+    name for ds_sets in GENE_SET_SPECS_BY_DS.values() for name in ds_sets
+})
+
+wildcard_constraints:
+    dataset        = "|".join(config["dataset_values"]) if config["dataset_values"] else "NO_DATASETS",
+    gene_set       = "|".join(_all_gene_set_names) if _all_gene_set_names else "NO_GENE_SETS",
+    # run_id_classic cannot start with `_` (reserved for the shared
+    # `_preprocessed` directory under each dataset). Any other label is allowed,
+    # so the user can bump it freely ("v1" -> "v2" -> "lr3e4_ablation" -> ...).
+    run_id_classic = r"[^_/][^/]*",
+    # preproc_id is a single path segment under the literal _preprocessed/ dir.
+    preproc_id     = r"[^/]+",
+    # radius path token: "r" + integer (radius value x100), e.g. r75 for 0.75.
+    radius         = r"r\d+",
+    # Ensemble member seed, a plain integer, used by the deep-ensemble rules only.
+    # The seed_{seed} path segment is also what keeps those rules unambiguous against the
+    # main training rules, whose output paths never carry it.
+    seed           = r"\d+",
+
+# -- Target files --------------------------------------------------------------
+# Preprocess outputs are shared by all gene_sets and all models:
+#   results/{dataset}/_preprocessed/{preproc_id}/r{NN}/
+#
+# Training outputs sit under a manual version label:
+#   results/{dataset}/{run_id_classic}/{gene_set}/r{NN}/{model_type}/[lambda_{lam}/]
+#
+# Bump that label after changing any parameter that is not part of the path. Otherwise the
+# outputs look up to date and Snakemake silently reuses the previous results.
+# `_preprocessed` is a reserved name, see the run_id_classic wildcard constraint above.
+# Which models run comes from config["model_types"]. Routing comes from MODEL_KINDS in
+# src/models/registry.py, so a new model type needs no edit here.
+
+import sys
+import yaml                                  # torch-free; used to read donor_slide_map.yaml for LOPO fold counts
+sys.path.insert(0, config["project_root"])
+from src.models.registry import MODEL_KINDS, types_of_kind, is_count_model  # registry is import-safe in snaky (no torch)
+
+RUN_ID_CLASSIC = config.get("run_id_classic", "v1")
+# Preprocessing version label. It sits one level above run_id_classic because the adata is
+# shared across run_ids and across both pipelines. Training rules bake it in as a fixed
+# string; only the preprocess rule carries it as a {preproc_id} wildcard.
+PREPROC_ID = config.get("preproc_id", "v1")
+
+
+# -- Radius path token ---------------------------------------------------------
+# Paths use a compact token "r{NN}" instead of "radius_{value}": 0.75 -> r75, 1.0 -> r100.
+# The {radius} wildcard carries the token. _r_value recovers the real number, which the
+# scripts need: they name the embeddings directory with it and record it in metrics.json.
+def _r_tag(r):
+    """Radius value -> path token, e.g. 0.75 -> 'r75'."""
+    return "r" + str(int(round(float(r) * 100)))
+
+def _r_value(tag):
+    """Path token -> radius value string, e.g. 'r75' -> '0.75' (inverse of _r_tag)."""
+    return str(int(tag[1:]) / 100)
+
+
+_active_model_types = set(config.get("model_types", []))
+
+# Group the active models by their registry kind. The rules below use the same groups, so
+# adding a model type to MODEL_KINDS routes it to the right rule with no edit here.
+_active_by_kind = {
+    "deterministic": [mt for mt in types_of_kind("deterministic") if mt in _active_model_types],
+    "gaussian_lam":  [mt for mt in types_of_kind("gaussian_lam")  if mt in _active_model_types],
+    "prob_no_lam":   [mt for mt in types_of_kind("prob_no_lam")   if mt in _active_model_types],
+}
+
+# Targets are built per dataset, because each dataset defines its own gene sets.
+def _classic_targets(kind):
+    """Build metrics.json targets for one kind of classic model."""
+    targets = []
+    for ds in config["dataset_values"]:
+        gene_set_keys = list(GENE_SET_SPECS_BY_DS[ds].keys())
+        if not gene_set_keys or not _active_by_kind[kind]:
+            continue
+        if kind == "deterministic":
+            targets += expand(
+                "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/metrics.json",
+                dataset        = [ds],
+                run_id_classic = [RUN_ID_CLASSIC],
+                gene_set       = gene_set_keys,
+                radius         = [_r_tag(r) for r in config["radius_values"]],
+                model_type     = _active_by_kind["deterministic"],
+            )
+        elif kind == "gaussian_lam":
+            targets += expand(
+                "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/lambda_{lam}/metrics.json",
+                dataset        = [ds],
+                run_id_classic = [RUN_ID_CLASSIC],
+                gene_set       = gene_set_keys,
+                radius         = [_r_tag(r) for r in config["radius_values"]],
+                model_type     = _active_by_kind["gaussian_lam"],
+                lam            = config["lambda_values"],
+            )
+        elif kind == "prob_no_lam":
+            # Same path shape as deterministic (no lambda subdir). Distinguished
+            # in the rules section by which model_types the wildcard matches.
+            targets += expand(
+                "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/metrics.json",
+                dataset        = [ds],
+                run_id_classic = [RUN_ID_CLASSIC],
+                gene_set       = gene_set_keys,
+                radius         = [_r_tag(r) for r in config["radius_values"]],
+                model_type     = _active_by_kind["prob_no_lam"],
+            )
+    return targets
+
+
+mse_targets             = _classic_targets("deterministic")
+gaussian_targets        = _classic_targets("gaussian_lam")
+lam_free_prob_targets   = _classic_targets("prob_no_lam")
+
+# Every completed classic run (its final metrics.json).
+classic_train_targets   = (mse_targets + gaussian_targets + lam_free_prob_targets)
+
+# -- Canal (post-hoc analysis) targets, one set per COMPLETED classic run ------
+# Each canal script reads one finished run dir and writes its output back into it. So a
+# canal target is a training target with metrics.json swapped for the canal's file.
+# Building them by substitution, not a fresh expand, keeps them in step with the sweep.
+# They cover compute_final_metrics=True runs only; ensemble members have their own targets.
+def _canal_out(metrics_path, rel):
+    return metrics_path[:-len("metrics.json")] + rel   # ".../{leaf}/metrics.json" -> ".../{leaf}/<rel>"
+
+canal1_classic_targets = [_canal_out(m, "benchmark_summary.json")                  for m in classic_train_targets]
+canal2_classic_targets = [_canal_out(m, "canal2_uncertainty/summary.json")         for m in classic_train_targets]
+canal3_classic_targets = [_canal_out(m, "canal3_zero_detection/summary.json")      for m in classic_train_targets]
+classic_canal_targets  = canal1_classic_targets + canal2_classic_targets + canal3_classic_targets
+
+_gaussian_model_types = _active_by_kind["gaussian_lam"]
+
+def _n_genes_for(wildcards):
+    """Effective gene count for a (dataset, gene_set), used to pick a resource tier.
+
+    A gene_set whose value is the literal "all" resolves to the string "all", not
+    to a list, so a bare len() returns 3 and puts the full panel in the smallest
+    budget. "all" means the whole gene panel of about 17k genes, the largest run,
+    so it maps to the top tier instead.
+
+    Resources are evaluated at scheduling time, which in a combined run is before
+    the upstream preprocess job has written the gene-list file. A missing file
+    falls back to the top tier, so a job is never under-budgeted; the real count
+    is used once the file exists.
+    """
+    try:
+        genes = _genes_for(wildcards.dataset, wildcards.gene_set)
+    except FileNotFoundError:
+        return 10**9                       # not resolvable yet => assume top tier
+    if genes == "all":
+        return 10**9                       # sentinel: "all" => top (largest) tier
+    return len(genes)
+
+
+# Time and memory budgets scale with the gene count: the model is the same at any size,
+# but the gene count drives the final CPU metric loops and the host RAM.
+def get_mse_train_time(wildcards):
+    '''Time budget by gene count. MSE has no NLL and no calibration, so it is the
+    fastest path.'''
+    n = _n_genes_for(wildcards)
+    if n <= 20:    return "00:15:00"
+    if n <= 500:   return "00:20:00"
+    if n <= 5000:  return "01:00:00"
+    return "04:00:00"
+
+
+def get_gaussian_train_time(wildcards):
+    '''Time budget by gene count. Gaussian models are slower than MSE because of the
+    NLL and the per-epoch calibration; the count models sharing this rule are slower
+    still, so they branch first.
+
+    "STI_nb" is in the test because those variants carry neither "negativebinomial"
+    nor "poisson" in their name, and would otherwise fall into the Gaussian tiers.'''
+    n = _n_genes_for(wildcards)
+    if ("negativebinomial" in wildcards.model_type or "poisson" in wildcards.model_type
+            or "STI_nb" in wildcards.model_type):
+        if n <= 500:   return "00:45:00"
+        if n <= 5000:  return "04:30:00"
+        return "12:00:00"
+    if n <= 10:    return "00:15:00"
+    if n <= 20:    return "00:20:00"
+    if n <= 500:   return "00:30:00"
+    if n <= 5000:  return "01:30:00"
+    return "06:00:00"
+
+
+def get_lam_free_prob_train_time(wildcards):
+    '''Time budget for the count models (Poisson, NB), which are slower than the
+    Gaussians because of g* and the native PIT calibration.'''
+    n = _n_genes_for(wildcards)
+    if n <= 10:    return "00:20:00"
+    if n <= 20:    return "00:25:00"
+    if n <= 500:   return "00:45:00"
+    if n <= 5000:  return "04:30:00"
+    return "12:00:00"
+
+
+def get_train_mem_mb(wildcards):
+    '''Host RAM by gene count. train.py holds the prediction arrays for a whole fold in
+    memory, as (n_spots x n_genes) float32, and the final metric pass reuses them.'''
+    n = _n_genes_for(wildcards)
+    if n <= 20:    return 20000
+    if n <= 500:   return 32000
+    if n <= 5000:  return 64000
+    return 128000
+
+
+# ==============================================================================
+# GCM (GeneConditionedMLP) pipeline, for `rule all_gcm`
+# ==============================================================================
+# Reads config["gcm"], writes results_gcm/{dataset}/{run_id}/... Every knob, the run_id
+# format and the directory layout are documented in the gcm: section of config.yaml.
+
+_gcm_cfg = config.get("gcm", {})
+
+# -- Run-id enumeration --------------------------------------------------------
+# Cartesian product over the sweep axes that the run_id encodes. The remaining axes
+# (model_type, lambda, radius) sit in the path below the run_id, as in the classic
+# pipeline. Each GCM_RUNS entry carries what the paths and the train_gcm.py call need.
+
+def _build_gcm_runs(gcm_cfg, run_id_gcm_override=None):
+    """Per-dataset cartesian product over the run_id sweep axes -> run-spec dicts.
+
+    The dev gene set is per dataset: gcm.dev_gene_sets[dataset] = {id: path|list}.
+    It is also a sweep axis, so it multiplies into the product and every run is tied
+    to one dataset. Two datasets may use different gene lists, and one dataset may
+    list several. dev_gene_set_id is the second run_id token, after the version token.
+
+    `run_id_gcm_override` replaces gcm.run_id_gcm as the run_id version token. The
+    deep ensemble passes ensemble.gcm.run_id_gcm here, over the same sweep axes, so
+    its members land in their own run_id tree, separate from the plain GCM runs.
+    """
+    if not gcm_cfg:
+        return []
+
+    dev_gene_sets   = gcm_cfg.get("dev_gene_sets", {})        # {dataset: {dev_id: path|list}}
+    chrom_specs     = list(gcm_cfg.get("chrom_split_specs", {}).keys())
+    gene_emb_ids    = list(gcm_cfg.get("gene_embedding_sources", {}).keys())
+    proj_vals       = gcm_cfg.get("use_projection_values", [False])
+    perm_vals       = gcm_cfg.get("permute_embeddings_values", [False])
+    run_id_gcm      = run_id_gcm_override or gcm_cfg.get("run_id_gcm", "v1")  # version token -> first run_id segment
+
+    runs = []
+    for dataset in config["dataset_values"]:
+        for dev_id in (dev_gene_sets.get(dataset) or {}).keys():
+            for chrom_spec in chrom_specs:
+                for gene_emb_id in gene_emb_ids:
+                    for proj in proj_vals:
+                        for perm in perm_vals:
+                            run_id = "{}__{}__{}__{}__proj{}__perm{}".format(
+                                run_id_gcm, dev_id, chrom_spec, gene_emb_id,
+                                int(bool(proj)), int(bool(perm))
+                            )
+                            runs.append({
+                                "dataset":            dataset,
+                                "run_id":             run_id,
+                                "dev_gene_set_id":    dev_id,
+                                "chrom_spec":         chrom_spec,
+                                "gene_emb_id":        gene_emb_id,
+                                "use_projection":     int(bool(proj)),
+                                "permute_embeddings": int(bool(perm)),
+                            })
+    return runs
+
+GCM_RUNS = _build_gcm_runs(_gcm_cfg)
+# Lookup keyed by (dataset, run_id). The dev gene set is per dataset, so two datasets
+# can share a dev_gene_set_id, produce the same run_id, and still point at different
+# gene files. The dataset in the key keeps those two runs distinct.
+GCM_RUN_BY_KEY = {(r["dataset"], r["run_id"]): r for r in GCM_RUNS}
+
+# ── GCM target lists ─────────────────────────────────────────────────────────
+# Two target lists, one per path template, mirroring the classic pipeline.
+
+_gcm_model_types    = set(_gcm_cfg.get("gcm_model_types", []))
+# Kind-based routing, mirroring the classic pipeline. Lambda-free kinds share a no-lambda
+# path; gaussian_lam gets a lambda_ subdir. Adding a type to gcm_model_types routes here
+# automatically, with no new rule.
+_gcm_lamfree_types  = [mt for mt in (types_of_kind("deterministic") + types_of_kind("prob_no_lam"))
+                       if mt in _gcm_model_types]
+_gcm_gaussian_types = [mt for mt in types_of_kind("gaussian_lam")
+                       if mt in _gcm_model_types]
+
+# Targets iterate GCM_RUNS, since each entry already carries its own dataset and
+# run_id. An expand() over datasets x run_ids would invent (dataset, run_id) pairs
+# that no run defines, because dev gene sets are per dataset.
+_gcm_radius_tags = [_r_tag(r) for r in _gcm_cfg.get("gcm_radius_values", [])]
+
+def _gcm_targets(model_types, with_lambda):
+    targets = []
+    for r in GCM_RUNS:
+        for radius in _gcm_radius_tags:
+            for mt in model_types:
+                base = f"results_gcm/{r['dataset']}/{r['run_id']}/{radius}/{mt}"
+                if with_lambda:
+                    for lam in _gcm_cfg.get("gcm_lambda_values", []):
+                        targets.append(f"{base}/lambda_{lam}/metrics.json")
+                else:
+                    targets.append(f"{base}/metrics.json")
+    return targets
+
+gcm_lamfree_targets  = _gcm_targets(_gcm_lamfree_types,  with_lambda=False) if _gcm_lamfree_types  else []
+gcm_gaussian_targets = _gcm_targets(_gcm_gaussian_types, with_lambda=True)  if _gcm_gaussian_types else []
+
+
+# ==============================================================================
+# Deep-ensemble targets (epistemic), config["ensemble"].
+# ==============================================================================
+# A member is a normal run plus a /seed_{seed}/ path segment and --seed. The seed changes
+# only init and shuffle, so all members share the same splits. lambda is fixed and left
+# out of the path, so one rule per pipeline serves every model kind.
+_ens_cfg          = config.get("ensemble", {})
+ENSEMBLE_SEEDS    = _ens_cfg.get("seed_values", [])
+ENSEMBLE_LAMBDA   = _ens_cfg.get("lambda", 1.0)
+ENSEMBLE_SEEDS_CSV = ",".join(str(s) for s in ENSEMBLE_SEEDS)   # --seeds arg for the combine rules
+
+_ens_classic        = _ens_cfg.get("classic", {})
+ENS_CLASSIC_RUNID   = _ens_classic.get("run_id", "ens_v1")
+ENS_CLASSIC_MODELS  = _ens_classic.get("model_types", [])
+ENS_CLASSIC_RADII   = [_r_tag(r) for r in _ens_classic.get("radius_values", config.get("radius_values", []))]
+_ens_classic_model_constraint = "|".join(ENS_CLASSIC_MODELS) or "NO_ENSEMBLE_CLASSIC_MODELS"
+
+# Hyperparameter overrides for classic ensemble MEMBERS only, e.g. to reproduce a
+# baseline's own recipe. Optional, and may set only some keys. It never touches the shared
+# top-level training keys that every other run reads.
+ENS_CLASSIC_HYPERPARAMS = _ens_classic.get("hyperparams", {}) or {}
+
+
+def _ens_classic_hp_flags(hp):
+    """Turn ensemble.classic.hyperparams into `--<flag> <value>` CLI overrides for
+    train.py, one flag per key present in `hp`. A key left out keeps the shared top-level
+    value. An absent or empty block gives "", which splices into train_ensemble_member's
+    shell command as nothing.
+
+    Every key mapped below must name a flag train.py defines. A flag it does not define
+    kills every ensemble job with an argparse "unrecognized arguments" error."""
+    flag_of = {
+        "lr":                    "--lr",
+        "batch_size":            "--batch-size",
+        "max_epochs":            "--max-epochs",
+        "patience":              "--patience",
+        "warmup_epochs":         "--warmup-epochs",
+        "early_stop_criterion":  "--early-stop-criterion",
+        "compute_final_metrics": "--compute-final-metrics",
+    }
+    parts = []
+    for key, flag in flag_of.items():
+        if key in hp:
+            val = hp[key]
+            if isinstance(val, bool):
+                val = "true" if val else "false"
+            parts.append(f"{flag} {val}")
+    return " ".join(parts)
+
+
+ENS_CLASSIC_HP_FLAGS = _ens_classic_hp_flags(ENS_CLASSIC_HYPERPARAMS)
+
+_ens_gcm            = _ens_cfg.get("gcm", {})
+ENS_GCM_RUNID       = _ens_gcm.get("run_id_gcm", "ens_v1")   # GCM analog of ensemble.classic.run_id
+ENS_GCM_MODELS      = _ens_gcm.get("model_types", [])
+ENS_GCM_RADII       = [_r_tag(r) for r in _ens_gcm.get("radius_values", _gcm_cfg.get("gcm_radius_values", []))]
+_ens_gcm_model_constraint = "|".join(ENS_GCM_MODELS) or "NO_ENSEMBLE_GCM_MODELS"
+
+# The GCM ensemble's own run set: the same sweep axes as GCM_RUNS, but under ENS_GCM_RUNID,
+# so its members land in an isolated run_id tree. Registered in GCM_RUN_BY_KEY so the
+# ensemble rule's (dataset, run_id) lookup resolves.
+GCM_ENSEMBLE_RUNS = _build_gcm_runs(_gcm_cfg, run_id_gcm_override=ENS_GCM_RUNID)
+GCM_RUN_BY_KEY.update({(r["dataset"], r["run_id"]): r for r in GCM_ENSEMBLE_RUNS})
+
+
+def _classic_ensemble_targets():
+    """One target per (dataset, gene_set, radius, model_type, seed). Gene sets come from
+    the active datasets.{ds}.gene_sets, the same source _genes_for resolves. Every active
+    panel gets a full ensemble, so trim that config block to the panels you want."""
+    if not (ENSEMBLE_SEEDS and ENS_CLASSIC_MODELS):
+        return []
+    targets = []
+    for ds in config["dataset_values"]:
+        gene_set_keys = list(GENE_SET_SPECS_BY_DS[ds].keys())
+        if not gene_set_keys:
+            continue
+        targets += expand(
+            "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/seed_{seed}/metrics.json",
+            dataset=[ds], run_id_classic=[ENS_CLASSIC_RUNID], gene_set=gene_set_keys,
+            radius=ENS_CLASSIC_RADII, model_type=ENS_CLASSIC_MODELS, seed=ENSEMBLE_SEEDS,
+        )
+    return targets
+
+
+def _gcm_ensemble_targets():
+    """One target per (GCM ensemble run, radius, gaussian model_type, seed). Iterates
+    GCM_ENSEMBLE_RUNS (the run set under ensemble.gcm.run_id_gcm), so members are
+    isolated under their own run_id; scope the sweep via gcm.dev_gene_sets."""
+    if not (ENSEMBLE_SEEDS and ENS_GCM_MODELS):
+        return []
+    targets = []
+    for run in GCM_ENSEMBLE_RUNS:
+        for radius in ENS_GCM_RADII:
+            for mt in ENS_GCM_MODELS:
+                for seed in ENSEMBLE_SEEDS:
+                    targets.append(
+                        f"results_gcm/{run['dataset']}/{run['run_id']}/{radius}/{mt}/seed_{seed}/metrics.json"
+                    )
+    return targets
+
+
+classic_ensemble_targets = _classic_ensemble_targets()
+gcm_ensemble_targets     = _gcm_ensemble_targets()
+
+
+# -- Deep-ensemble COMBINE targets ---------------------------------------------
+# Fan the M seed-members of one model into a single test_summaries.h5ad. Same axes as the
+# member targets, minus the seed. Kept on their own target, not wired into all_train_ensemble:
+# the fan-in needs every seed present, so launch them once the members are done.
+def _classic_ensemble_combine_targets():
+    if not (ENSEMBLE_SEEDS and ENS_CLASSIC_MODELS):
+        return []
+    targets = []
+    for ds in config["dataset_values"]:
+        gene_set_keys = list(GENE_SET_SPECS_BY_DS[ds].keys())
+        if not gene_set_keys:
+            continue
+        targets += expand(
+            "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/ensemble/test_summaries.h5ad",
+            dataset=[ds], run_id_classic=[ENS_CLASSIC_RUNID], gene_set=gene_set_keys,
+            radius=ENS_CLASSIC_RADII, model_type=ENS_CLASSIC_MODELS,
+        )
+    return targets
+
+
+def _gcm_ensemble_combine_targets():
+    if not (ENSEMBLE_SEEDS and ENS_GCM_MODELS):
+        return []
+    targets = []
+    for run in GCM_ENSEMBLE_RUNS:
+        for radius in ENS_GCM_RADII:
+            for mt in ENS_GCM_MODELS:
+                targets.append(
+                    f"results_gcm/{run['dataset']}/{run['run_id']}/{radius}/{mt}/ensemble/test_summaries.h5ad"
+                )
+    return targets
+
+
+classic_ensemble_combine_targets = _classic_ensemble_combine_targets()
+gcm_ensemble_combine_targets     = _gcm_ensemble_combine_targets()
+
+
+# ==============================================================================
+# Deep-ensemble POST-HOC chain (classic): g* -> combine -> canals.
+# ==============================================================================
+# Targets are derived from the ensemble sweep axes, so they cannot drift from the members.
+# Snakemake orders the chain from real file deps: the canals need the combine's
+# test_summaries.h5ad, and for count models the combine needs the g* files.
+# Torch-free at DAG-build time, like the deferred-metrics block below: the Snakemake
+# controller runs in snaky, which has no torch.
+
+# g* is defined only for count likelihoods. is_count_model uses the same classification as
+# specs.py and deep_ensemble_combine, so combine_ensemble_classic's g* dependency and
+# combine's own want_gstar scope gate select the same set of models.
+ENS_CLASSIC_COUNT_MODELS    = [mt for mt in ENS_CLASSIC_MODELS if is_count_model(mt)]
+_ens_count_model_constraint = "|".join(ENS_CLASSIC_COUNT_MODELS) or "NO_ENSEMBLE_COUNT_MODELS"
+
+# LOPO fold indices = range(K), K = the donor count in donor_slide_map.yaml. Fold k holds
+# out the k-th donor, matching what train.py derives from the same map. Parsed with plain
+# yaml rather than splitting.py, which imports sklearn, absent from the snaky controller.
+# Two assumptions. cv.strategy is lopo_next_val, and every mapped donor has spots. A donor
+# with no spots shrinks the real K, so the extra g* target has no preds_fold file to read
+# and its job fails.
+_DONOR_MAP_PATH = os.path.join(config["project_root"], "snake/config/donor_slide_map.yaml")
+with open(_DONOR_MAP_PATH) as _f:
+    _DONOR_MAP = yaml.safe_load(_f) or {}
+
+def _ens_folds(dataset):
+    donors = _DONOR_MAP.get(dataset)
+    if not donors:
+        raise ValueError(
+            f"{dataset} absent from donor_slide_map.yaml (or empty), so the LOPO fold "
+            f"count is unknown at DAG-build time. Add it to the map (or, for a 1:1 "
+            f"donor==slide dataset, extend _ens_folds to count the slide_sample_list).")
+    return list(range(len(donors)))
+
+
+def _classic_ensemble_gstar_targets():
+    """One g* target per (dataset, gene_set, radius, COUNT model, seed, fold)."""
+    if not (ENSEMBLE_SEEDS and ENS_CLASSIC_COUNT_MODELS):
+        return []
+    targets = []
+    for ds in config["dataset_values"]:
+        gene_set_keys = list(GENE_SET_SPECS_BY_DS[ds].keys())
+        if not gene_set_keys:
+            continue
+        targets += expand(
+            "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/seed_{seed}/predictions/gstar_fold{k}.h5ad",
+            dataset=[ds], run_id_classic=[ENS_CLASSIC_RUNID], gene_set=gene_set_keys,
+            radius=ENS_CLASSIC_RADII, model_type=ENS_CLASSIC_COUNT_MODELS,
+            seed=ENSEMBLE_SEEDS, k=_ens_folds(ds))
+    return targets
+
+
+def _classic_ensemble_canal_targets():
+    """Canal targets derived from the ensemble combine sweep. All three canals cover every
+    ensembled family:
+      canal1: one benchmark_summary.json per model. Count heads are scored on g*, the
+              continuous heads directly on their own reporting axis; a count ensemble
+              whose test_summaries.h5ad lacks the g*/PIT layers raises.
+      canal2: one summary.json per (model, uncertainty source). A head with no uncertainty
+              at all (msemeanonly) takes canal2's graceful not_applicable exit, which still
+              writes summary.json, so the target appears for every pair.
+      canal3: one summary.json per model. Count heads read the zero_prob layer, which
+              reaches test_summaries.h5ad through the g* chain."""
+    if not (ENSEMBLE_SEEDS and ENS_CLASSIC_MODELS):
+        return []
+    ENS = "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/ensemble"
+    c1, c2, c3 = [], [], []
+    for ds in config["dataset_values"]:
+        gene_set_keys = list(GENE_SET_SPECS_BY_DS[ds].keys())
+        if not gene_set_keys:
+            continue
+        common = dict(dataset=[ds], run_id_classic=[ENS_CLASSIC_RUNID],
+                      gene_set=gene_set_keys, radius=ENS_CLASSIC_RADII)
+        # canal1 covers every ensembled family, like c2 and c3 below. This expand and
+        # canal1_ensemble's model_type constraint have to widen together.
+        c1 += expand(ENS + "/benchmark_summary.json",
+                     model_type=ENS_CLASSIC_MODELS, **common)
+        c2 += expand(ENS + "/canal2_uncertainty/{source}/summary.json",
+                     model_type=ENS_CLASSIC_MODELS,
+                     source=["total", "aleatoric", "epistemic"], **common)
+        c3 += expand(ENS + "/canal3_zero_detection/summary.json",
+                     model_type=ENS_CLASSIC_MODELS, **common)
+    return c1 + c2 + c3
+
+
+classic_ensemble_gstar_targets = _classic_ensemble_gstar_targets()
+classic_ensemble_canal_targets = _classic_ensemble_canal_targets()
+
+
+# ==============================================================================
+# CLASSIC DEFERRED-METRICS chain: g* -> completion -> canals.
+# ==============================================================================
+# The ensemble chain above, minus the seed axis, with a metric completion in place of the
+# combine.
+#
+# With compute_final_metrics=True the fold-end CPU metric pass runs inside the training
+# job, so a GPU is held for hours doing CPU work. Deferring splits it into short per-fold
+# GPU g* jobs plus one CPU-only completion. No result changes.
+#
+# The config flag is the gate. With compute_final_metrics=True the two rules below produce
+# no targets and the canals read metrics.json. One global flag
+# means a tree cannot mix both modes. That is fine: one launch reads one config.
+# Torch-free, so the snaky DAG build never imports torch.
+# ==============================================================================
+
+CLASSIC_DEFERRED = not bool(config.get("compute_final_metrics", True))
+
+# Count models of the classic sweep. Built from the config LIST, not the set, so the regex
+# alternation below is deterministic. Count models never carry a /lambda_ segment, so the
+# g* rule can key on {model_type}. The completion rule also covers the Gaussians, so it
+# needs {leaf}.
+CLASSIC_COUNT_MODELS      = [mt for mt in config.get("model_types", []) if is_count_model(mt)]
+_classic_count_constraint = "|".join(CLASSIC_COUNT_MODELS) or "NO_CLASSIC_COUNT_MODELS"
+
+# g* WALL TIME: flat and generous on purpose. The cost is the width of the marching window
+# in count_expected_log1p. It is vectorised over a gene chunk, so a few wide cells set the
+# g* time is deliberately generous. Its cost is set by the widest cell in a gene chunk,
+# which nothing at DAG-build time can predict, so a tight budget kills jobs.
+
+
+def _classic_folds(dataset):
+    """LOPO fold indices for a classic-sweep dataset. Same logic as _ens_folds, kept
+    separate on purpose: the error message is the payload and each chain needs its own.
+    This one names compute_final_metrics: True, the inline path that needs no fold
+    enumeration, which is not advice the ensemble chain can give. The coverage check
+    below reports every missing dataset at once, before any target loop raises."""
+    donors = _DONOR_MAP.get(dataset)
+    if not donors:
+        raise ValueError(
+            f"{dataset}: absent from snake/config/donor_slide_map.yaml, so its LOPO fold "
+            f"count is unknown at DAG-build time and the per-fold g* targets cannot be "
+            f"enumerated. Add it to the map, or set compute_final_metrics: True to use the "
+            f"inline path, which needs no fold enumeration.")
+    return list(range(len(donors)))
+
+
+# Up-front coverage check: fail ONCE with the whole list rather than raising on whichever
+# dataset the target loop happens to reach first (a mid-build raise stops the ENTIRE DAG,
+# not just this chain). Only meaningful in deferred mode with count models -- that is the
+# only combination needing a fold count.
+if CLASSIC_DEFERRED and CLASSIC_COUNT_MODELS:
+    _missing_donor_map = [ds for ds in config["dataset_values"] if not _DONOR_MAP.get(ds)]
+    if _missing_donor_map:
+        raise ValueError(
+            f"compute_final_metrics is False (deferred classic chain) and these datasets are "
+            f"absent from snake/config/donor_slide_map.yaml: {_missing_donor_map}. The "
+            f"per-fold g* targets cannot be enumerated without a donor count. Add them to "
+            f"the map (or, for a 1:1 donor==slide dataset, add the identity block).")
+
+# The completion's sentinel. Deliberately NOT metrics.json: complete_deferred_metrics.py
+# rewrites that file IN PLACE, so declaring it as this rule's output would leave the output
+# newer than its own input on every run and re-fire the job forever under
+# --rerun-triggers mtime. Named (not dot-hidden) so it is visible when browsing a run dir.
+CLASSIC_METRICS_SENTINEL = "metrics_complete.done"
+
+# What the three canal rules take as input: the sentinel in deferred mode (which is what
+# guarantees metrics.json is complete AND atoms.parquet exists), metrics.json itself
+# otherwise.
+_CANAL_INPUT_REL = ("/" + CLASSIC_METRICS_SENTINEL) if CLASSIC_DEFERRED else "/metrics.json"
+
+
+def _classic_gstar_targets():
+    """One g* target per (dataset, gene_set, radius, COUNT model, fold). Empty unless the
+    run is deferred: in inline mode g* is computed inside the training job."""
+    if not (CLASSIC_DEFERRED and CLASSIC_COUNT_MODELS):
+        return []
+    targets = []
+    for ds in config["dataset_values"]:
+        gene_set_keys = list(GENE_SET_SPECS_BY_DS[ds].keys())
+        if not gene_set_keys:
+            continue
+        targets += expand(
+            "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/predictions/gstar_fold{k}.h5ad",
+            dataset=[ds], run_id_classic=[RUN_ID_CLASSIC], gene_set=gene_set_keys,
+            radius=[_r_tag(r) for r in config["radius_values"]],
+            model_type=CLASSIC_COUNT_MODELS, k=_classic_folds(ds))
+    return targets
+
+
+classic_gstar_targets = _classic_gstar_targets()
+# Completion sentinels derived from the TRAINING targets by substitution (the same trick as
+# classic_canal_targets), so they can never drift from the sweep.
+classic_complete_targets = ([_canal_out(m, CLASSIC_METRICS_SENTINEL) for m in classic_train_targets]
+                            if CLASSIC_DEFERRED else [])
+
+
+# ── GCM resource heuristics (single GPU; keyed on THIS run's dev gene-set size) ─
+def _gcm_n_dev_genes(wildcards):
+    """Gene count of this run's dev gene set — resolved per (dataset, dev_gene_set_id)
+    from gcm.dev_gene_sets. Inline list -> len; path -> line count ({preproc_id}
+    expanded, relative paths under project_root)."""
+    r = GCM_RUN_BY_KEY[(wildcards.dataset, wildcards.run_id)]
+    spec = (_gcm_cfg.get("dev_gene_sets", {}).get(wildcards.dataset) or {}).get(r["dev_gene_set_id"])
+    if isinstance(spec, (list, tuple)):
+        return len(spec)
+    path = str(spec).format(preproc_id=PREPROC_ID)
+    if not os.path.isabs(path):
+        path = os.path.join(config["project_root"], path)
+    try:
+        with open(path) as f:
+            return sum(1 for line in f if line.strip())
+    except FileNotFoundError:
+        return 100  # fall back to the default-sized run
+
+
+def get_gcm_train_time(wildcards):
+    """Time budget by dev gene-set size and model kind. Gaussian models are slower
+    because of the NLL and the per-epoch calibration, so they get their own tiers."""
+    n_dev = _gcm_n_dev_genes(wildcards)
+    gaussian = wildcards.model_type in _gcm_gaussian_types
+    if n_dev <= 50:     return "00:15:00" if gaussian else "00:10:00"
+    elif n_dev <= 200:  return "00:20:00" if gaussian else "00:15:00"
+    elif n_dev <= 1000: return "00:30:00" if gaussian else "00:20:00"
+    elif n_dev <= 5000: return "01:00:00" if gaussian else "00:45:00"
+    else:               return "04:00:00" if gaussian else "06:00:00"
+
+
+def get_gcm_train_mem(wildcards):
+    """Host RAM (MB). The GPU holds spot_emb / gene_emb / y; host peak is the
+    adata read + the per-fold predictions AnnData built over ALL genes. Scales
+    with the dev gene-set size (same coarse-tier idea as the classic pipeline)."""
+    n_dev = _gcm_n_dev_genes(wildcards)
+    if n_dev <= 200:   return 32000
+    elif n_dev <= 1000:return 48000
+    elif n_dev <= 5000:return 96000
+    else:              return 160000
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Top-level targets. The naming convention and the full tree -- train-only, canal-only,
+# deferred-metrics and deep-ensemble variants -- are set out below the preprocessing block.
+#   rule all          classic train + canal, plus GCM training
+#   rule all_classic  classic only, train + canal: one multi-output MLP per gene set
+#   rule all_gcm      GCM only, training: gene embedding concatenated to the spot embedding
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Preprocessing targets — union of classic and GCM radius values per dataset.
+_all_radius_values = sorted(set(
+    config.get("radius_values", []) +
+    _gcm_cfg.get("gcm_radius_values", [])
+))
+
+preprocess_targets = expand(
+    "results/{dataset}/_preprocessed/{preproc_id}/{radius}/adata.h5ad",
+    dataset    = config["dataset_values"],
+    preproc_id = [PREPROC_ID],
+    radius     = [_r_tag(r) for r in _all_radius_values],
+)
+# ─────────────────────────────────────────────────────────────────────────────
+
+rule all_preprocess:
+    input:
+        preprocess_targets
+
+
+# -- Target tree ---------------------------------------------------------------
+# Naming convention:
+#   all_train_*  models only, no canals
+#   all_canal_*  the post-hoc canals only
+#   all_classic  the union, train + canal
+# `all` is classic training + classic canals + GCM training. The GCM has no canal rules.
+# The deep-ensemble chain has its own all_train_ensemble* targets below; `all` never pulls it in.
+
+rule all:
+    input:
+        classic_train_targets + classic_canal_targets +
+        gcm_lamfree_targets + gcm_gaussian_targets
+
+rule all_train_only:
+    input:
+        classic_train_targets + gcm_lamfree_targets + gcm_gaussian_targets
+
+rule all_classic:
+    input:
+        classic_train_targets + classic_canal_targets
+
+rule all_train_classic:
+    input:
+        classic_train_targets
+
+rule all_canal_classic:
+    input:
+        classic_canal_targets
+
+# Classic deferred-metrics chain, addressable one step at a time. Both lists are empty when
+# compute_final_metrics is True, so these targets do nothing in inline mode.
+# A normal launch does not need them: in deferred mode the canal rules take the sentinel as
+# input, so all_canal_classic already pulls the completion, and the completion pulls g*.
+# They exist so a large sweep can relaunch just the g* step, or just the completion.
+rule all_gstar_classic:
+    input:
+        classic_gstar_targets
+
+rule all_complete_classic:
+    input:
+        classic_complete_targets
+
+rule all_gcm:
+    input:
+        gcm_lamfree_targets + gcm_gaussian_targets
+
+# Deep-ensemble targets (epistemic uncertainty). Classic and GCM get separate targets so
+# either ensemble can be launched on its own. Each one's scope comes from its own config
+# block: ensemble.classic.model_types and ensemble.gcm.model_types.
+rule all_train_ensemble:
+    input:
+        classic_ensemble_targets + gcm_ensemble_targets
+
+rule all_train_ensemble_classic:
+    input:
+        classic_ensemble_targets
+
+rule all_train_ensemble_gcm:
+    input:
+        gcm_ensemble_targets
+
+# Deep-ensemble combine: fan the seed members of one model into a single
+# test_summaries.h5ad. Kept off all_train_ensemble because the fan-in needs every seed present,
+# so launch it once the members are done.
+rule all_ensemble_combine:
+    input:
+        classic_ensemble_combine_targets + gcm_ensemble_combine_targets
+
+rule all_ensemble_combine_classic:
+    input:
+        classic_ensemble_combine_targets
+
+rule all_ensemble_combine_gcm:
+    input:
+        gcm_ensemble_combine_targets
+
+# Deep-ensemble post-hoc chain (classic), the analog of all_canal_classic. Snakemake orders
+# g* -> combine -> canals from the file deps declared on the rules; why g* must precede
+# combine for count models is on rule combine_ensemble_classic. g* and combine are listed
+# next to the canals so a partial launch can address one step. Both targets are kept out of
+# all_train_ensemble and out of `all`, so a members launch never pulls in the g* GPU jobs.
+rule all_ensemble_gstar_classic:
+    input:
+        classic_ensemble_gstar_targets
+
+rule all_ensemble_classic:
+    input:
+        classic_ensemble_gstar_targets +
+        classic_ensemble_combine_targets +
+        classic_ensemble_canal_targets
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Preprocessing: runs once per (dataset, preproc_id, radius). Gene-set-independent.
+# Produces a single unified adata.h5ad + reusable HVG gene-list files.
+# Shared by both the classic and GCM pipelines.
+# ─────────────────────────────────────────────────────────────────────────────
+rule preprocess:
+    output:
+        adata    = "results/{dataset}/_preprocessed/{preproc_id}/{radius}/adata.h5ad",
+        hvg_dir  = directory("results/{dataset}/_preprocessed/{preproc_id}/{radius}/hvg"),
+        config   = "results/{dataset}/_preprocessed/{preproc_id}/{radius}/preprocess_config.json",
+    params:
+        n_top = ",".join(str(n) for n in config["n_top_values"]),
+        radius_val = lambda wc: _r_value(wc.radius),
+    resources:
+        time      = "02:00:00",
+        cpus      = 18,
+        mem_mb    = 155000,
+        gpus      = 0,
+        partition = "compute",
+    log:
+        "results/{dataset}/_preprocessed/{preproc_id}/{radius}/logs/preprocess.log"
+    shell:
+        "python -u src/data/load_and_preprocess.py "
+        "--dataset {wildcards.dataset} "
+        "--radius {params.radius_val} "
+        "--n-top {params.n_top} "
+        "--config snake/config/config.yaml "
+        "--out-adata {output.adata} "
+        "--out-hvg-dir {output.hvg_dir} "
+        "--out-config {output.config} "
+        "2>&1 | tee {log}"
+
+
+# ------------------------------------------------------------------------------
+# Classic training, consuming the shared preprocess outputs. One run per
+# (run_id_classic, gene_set, radius, model_type[, lambda]).
+#
+# Three rules cover the three model kinds in src/models/registry.py:
+#   train_mse           deterministic (MSE / mean-only), no lambda subdir
+#   train_gaussian      gaussian_lam, a lambda subdir carrying the beta-NLL exponent
+#   train_lam_free_prob prob_no_lam (Poisson, NB), no lambda subdir
+#
+# All three call the SAME script; the spec system inside it handles the model-specific
+# behavior. The rules differ only in which model_type wildcards they match, whether the
+# path has a /lambda_{lam}/ segment, and their resource budgets.
+# ------------------------------------------------------------------------------
+
+_deterministic_constraint  = "|".join(types_of_kind("deterministic")) or "NO_DET_MODELS"
+_gaussian_lam_constraint   = "|".join(types_of_kind("gaussian_lam")) or "NO_GAUSS_MODELS"
+_lam_free_prob_constraint  = "|".join(types_of_kind("prob_no_lam"))   or "NO_LFP_MODELS"
+
+
+rule train_mse:
+    input:
+        adata = f"results/{{dataset}}/_preprocessed/{PREPROC_ID}/{{radius}}/adata.h5ad",
+    output:
+        metrics = "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/metrics.json",
+        model   = "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/model.pt",
+    params:
+        lam        = 1.0,                # ignored by the spec; required by CLI
+        genes_csv  = get_genes_csv,
+        radius_val = lambda wc: _r_value(wc.radius),
+    wildcard_constraints:
+        model_type = _deterministic_constraint,
+    resources:
+        time      = get_mse_train_time,
+        cpus      = 5,
+        mem_mb    = get_train_mem_mb,
+        gpus      = 1,
+        partition = "gpu",
+    log:
+        "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/logs/train_{model_type}.log"
+    shell:
+        "python -u snake/scripts/train.py "
+        "--data {input.adata} "
+        "--out-metrics {output.metrics} "
+        "--out-model {output.model} "
+        "--model-type {wildcards.model_type} "
+        "--lam {params.lam} "
+        "--dataset {wildcards.dataset} "
+        "--gene-set {wildcards.gene_set} "
+        "--genes {params.genes_csv} "
+        "--radius {params.radius_val} "
+        "--run-id-classic {wildcards.run_id_classic} "
+        "2>&1 | tee {log}"
+
+
+rule train_gaussian:
+    input:
+        adata = f"results/{{dataset}}/_preprocessed/{PREPROC_ID}/{{radius}}/adata.h5ad",
+    output:
+        metrics = "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/lambda_{lam}/metrics.json",
+        model   = "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/lambda_{lam}/model.pt",
+    params:
+        genes_csv  = get_genes_csv,
+        radius_val = lambda wc: _r_value(wc.radius),
+    wildcard_constraints:
+        model_type = _gaussian_lam_constraint,
+    resources:
+        time      = get_gaussian_train_time,
+        cpus      = 5,
+        mem_mb    = get_train_mem_mb,
+        gpus      = 1,
+        partition = "gpu",
+    log:
+        "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/logs/train_{model_type}_lam{lam}.log"
+    shell:
+        # GPU monitor files are scoped per (model_type, lam): the logs/ dir is
+        # shared across model types and lambdas for one (gene_set, radius), so a
+        # bare gpu_raw.csv/gpu_summary.txt would be clobbered by concurrent runs.
+        "LOGDIR=$(dirname {log}); "
+        "GPU_RAW=$LOGDIR/gpu_raw_{wildcards.model_type}_lam{wildcards.lam}.csv; "
+        "GPU_SUM=$LOGDIR/gpu_summary_{wildcards.model_type}_lam{wildcards.lam}.txt; "
+        "nvidia-smi --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.total "
+        "  --format=csv -l 1 > $GPU_RAW & "
+        "NVSMI_PID=$!; trap 'kill $NVSMI_PID 2>/dev/null' EXIT; "
+        "python -u snake/scripts/train.py "
+        "  --data {input.adata} --out-metrics {output.metrics} --out-model {output.model} "
+        "  --model-type {wildcards.model_type} --lam {wildcards.lam} --dataset {wildcards.dataset} "
+        "  --gene-set {wildcards.gene_set} --genes {params.genes_csv} --radius {params.radius_val} "
+        "  --run-id-classic {wildcards.run_id_classic} "
+        # RC re-raises the TRAINING exit code at the end, so a crash is not masked by
+        # gpu_summarize. The kill + summary still run on failure (see tee note at the top).
+        "  2>&1 | tee {log}; RC=$?; "
+        "kill $NVSMI_PID 2>/dev/null; "
+        "python snake/scripts/gpu_summarize.py $GPU_RAW $GPU_SUM --skip-seconds 20; "
+        "exit $RC"
+
+
+rule train_lam_free_prob:
+    """Probabilistic models with no lambda in the loss (Poisson, NB).
+    Path shape matches train_mse (no lambda subdir), and the script is the same
+    one: the spec decides the target source, the loss, and the prediction
+    extraction."""
+    input:
+        adata = f"results/{{dataset}}/_preprocessed/{PREPROC_ID}/{{radius}}/adata.h5ad",
+    output:
+        metrics = "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/metrics.json",
+        model   = "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/model.pt",
+    params:
+        lam        = 1.0,                # required by CLI; spec ignores it
+        genes_csv  = get_genes_csv,
+        radius_val = lambda wc: _r_value(wc.radius),
+    wildcard_constraints:
+        model_type = _lam_free_prob_constraint,
+    resources:
+        time      = get_lam_free_prob_train_time,
+        cpus      = 5,
+        mem_mb    = get_train_mem_mb,
+        gpus      = 1,
+        partition = "gpu",
+    log:
+        "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/logs/train_{model_type}.log"
+    shell:
+        # GPU monitor files are scoped per model_type: the logs/ dir is shared
+        # across model types for one (gene_set, radius), so a bare
+        # gpu_raw.csv/gpu_summary.txt would be clobbered by concurrent runs.
+        "LOGDIR=$(dirname {log}); "
+        "GPU_RAW=$LOGDIR/gpu_raw_{wildcards.model_type}.csv; "
+        "GPU_SUM=$LOGDIR/gpu_summary_{wildcards.model_type}.txt; "
+        "nvidia-smi --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.total "
+        "  --format=csv -l 1 > $GPU_RAW & "
+        "NVSMI_PID=$!; trap 'kill $NVSMI_PID 2>/dev/null' EXIT; "
+        "python -u snake/scripts/train.py "
+        "  --data {input.adata} --out-metrics {output.metrics} --out-model {output.model} "
+        "  --model-type {wildcards.model_type} --lam {params.lam} --dataset {wildcards.dataset} "
+        "  --gene-set {wildcards.gene_set} --genes {params.genes_csv} --radius {params.radius_val} "
+        "  --run-id-classic {wildcards.run_id_classic} "
+        # RC re-raises the TRAINING exit code at the end, so a crash is not masked by
+        # gpu_summarize. The kill + summary still run on failure (see tee note at the top).
+        "  2>&1 | tee {log}; RC=$?; "
+        "kill $NVSMI_PID 2>/dev/null; "
+        "python snake/scripts/gpu_summarize.py $GPU_RAW $GPU_SUM --skip-seconds 20; "
+        "exit $RC"
+
+
+# ------------------------------------------------------------------------------
+# Classic deep-ensemble member. One rule covers every ensemble model kind.
+#
+# A member is the classic training plus a trailing /seed_{seed}/ path segment and --seed.
+# The seed varies initialization and shuffling only, so all members share the same splits.
+# lambda is a constant here and stays out of the path: the Gaussians use it as the NLL
+# weight and the other kinds ignore it, so one rule serves them all. Wildcards never cross
+# "/", so the extra seed_{seed} segment is what keeps this rule unambiguous against the
+# training rules above.
+# ------------------------------------------------------------------------------
+rule train_ensemble_member:
+    input:
+        adata = f"results/{{dataset}}/_preprocessed/{PREPROC_ID}/{{radius}}/adata.h5ad",
+    output:
+        metrics = "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/seed_{seed}/metrics.json",
+        model   = "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/seed_{seed}/model.pt",
+    params:
+        lam        = ENSEMBLE_LAMBDA,
+        genes_csv  = get_genes_csv,
+        radius_val = lambda wc: _r_value(wc.radius),
+        # Optional hyperparameter overrides (ensemble.classic.hyperparams) as extra
+        # train.py CLI flags. "" when the sub-block is absent or empty.
+        hp_flags   = ENS_CLASSIC_HP_FLAGS,
+    wildcard_constraints:
+        model_type = _ens_classic_model_constraint,
+        seed       = r"\d+",
+    resources:
+        time      = get_gaussian_train_time,
+        cpus      = 5,
+        mem_mb    = get_train_mem_mb,
+        gpus      = 1,
+        partition = "gpu",
+    log:
+        "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/logs/train_{model_type}_seed{seed}.log"
+    shell:
+        # GPU monitor files scoped per (model_type, seed): the logs/ dir is shared
+        # across model types/seeds for one (gene_set, radius), so bare names clash.
+        "LOGDIR=$(dirname {log}); "
+        "GPU_RAW=$LOGDIR/gpu_raw_{wildcards.model_type}_seed{wildcards.seed}.csv; "
+        "GPU_SUM=$LOGDIR/gpu_summary_{wildcards.model_type}_seed{wildcards.seed}.txt; "
+        "nvidia-smi --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.total "
+        "  --format=csv -l 1 > $GPU_RAW & "
+        "NVSMI_PID=$!; trap 'kill $NVSMI_PID 2>/dev/null' EXIT; "
+        "python -u snake/scripts/train.py "
+        "  --data {input.adata} --out-metrics {output.metrics} --out-model {output.model} "
+        "  --model-type {wildcards.model_type} --lam {params.lam} --dataset {wildcards.dataset} "
+        "  --gene-set {wildcards.gene_set} --genes {params.genes_csv} --radius {params.radius_val} "
+        "  --run-id-classic {wildcards.run_id_classic} --seed {wildcards.seed} "
+        "{params.hp_flags}"
+        # RC re-raises the TRAINING exit code at the end, so a crash is not masked by
+        # gpu_summarize. The kill + summary still run on failure (see tee note at the top).
+        "  2>&1 | tee {log}; RC=$?; "
+        "kill $NVSMI_PID 2>/dev/null; "
+        "python snake/scripts/gpu_summarize.py $GPU_RAW $GPU_SUM --skip-seconds 20; "
+        "exit $RC"
+
+
+# Classic deep-ensemble COMBINE: fan-in the ENSEMBLE_SEEDS members of ONE
+# (gene_set, radius, model_type) into a single test_summaries.h5ad. Pure read + numpy,
+# no GPU. The members' metrics.json are the "member done" sentinel inputs.
+rule combine_ensemble_classic:
+    input:
+        members = lambda wc: expand(
+            "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/seed_{seed}/metrics.json",
+            dataset=[wc.dataset], run_id_classic=[wc.run_id_classic], gene_set=[wc.gene_set],
+            radius=[wc.radius], model_type=[wc.model_type], seed=ENSEMBLE_SEEDS),
+        # Count models only: this input forces the g* jobs to run before the combine. The
+        # combine consolidates the gstar/pit/zero_prob layers only if it finds
+        # gstar_fold*.h5ad on disk, the want_gstar gate in deep_ensemble_combine.py. Without
+        # this dependency it can run first and silently drop those layers, leaving canal1
+        # and canal3 to read a summary file that lacks them. Gaussians are not count models
+        # and get no g* dependency.
+        gstar   = lambda wc: (
+            expand(
+                "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/seed_{seed}/predictions/gstar_fold{k}.h5ad",
+                dataset=[wc.dataset], run_id_classic=[wc.run_id_classic], gene_set=[wc.gene_set],
+                radius=[wc.radius], model_type=[wc.model_type],
+                seed=ENSEMBLE_SEEDS, k=_ens_folds(wc.dataset))
+            if is_count_model(wc.model_type) else []),
+    output:
+        summary = "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/ensemble/test_summaries.h5ad",
+    params:
+        model_dir = "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}",
+        seeds     = ENSEMBLE_SEEDS_CSV,
+    wildcard_constraints:
+        run_id_classic = ENS_CLASSIC_RUNID,
+        model_type     = _ens_classic_model_constraint,
+    resources:
+        # CPU-only: gpus=0 with partition=compute lands the job on a CPU node.
+        time = "00:30:00", cpus = 2, mem_mb = 32000, gpus = 0, partition = "compute",
+    shell:
+        # No redirect on purpose. The script's timing prints go to the SLURM job stdout,
+        # snake/logs/slurm_combine_ensemble_classic_<jobid>.out, so look them up by job id
+        # rather than in a per-model log file.
+        "python -u snake/scripts/epistemic/deep_ensemble_combine.py "
+        "  --model-dir {params.model_dir} --seeds {params.seeds}"
+
+
+# Deep-ensemble g* precompute, count models only. One job per (seed, fold), because each
+# preds_fold{k}.h5ad is independent on disk, and on GPU because count_expected_log1p is
+# much slower on CPU. The job writes the sibling predictions/gstar_fold{k}.h5ad that the
+# combine's want_gstar gate globs. The input is the seed member's metrics.json, which
+# train.py writes after the fold loop, so every preds_fold*.h5ad of that seed exists by
+# the time this job starts. The per-fold predictions file is an undeclared side-output of
+# training, so it is passed as a param instead of a tracked input.
+rule gstar_ensemble_classic:
+    input:
+        member = "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/seed_{seed}/metrics.json",
+    output:
+        gstar  = "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/seed_{seed}/predictions/gstar_fold{k}.h5ad",
+    params:
+        pred_file = "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/seed_{seed}/predictions/preds_fold{k}.h5ad",
+    wildcard_constraints:
+        run_id_classic = ENS_CLASSIC_RUNID,
+        model_type     = _ens_count_model_constraint,   # count-only: DE_gstar_precompute raises on a non-count target
+        radius         = r"r[0-9]+",
+        seed           = r"\d+",
+        k              = r"\d+",
+    resources:
+        time = "00:30:00", cpus = 2, mem_mb = 32000, gpus = 1, partition = "gpu",
+    log:
+        "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/seed_{seed}/logs/gstar_fold{k}.log"
+    shell:
+        # --out-file == the default sibling path (preds_ -> gstar_), passed explicitly so the
+        # declared output is bit-identical to what the script writes. --device cuda (GPU rule).
+        "python -u snake/scripts/epistemic/DE_gstar_precompute.py "
+        "  --pred-file {params.pred_file} --out-file {output.gstar} --device cuda "
+        "  2>&1 | tee {log}"
+
+
+# ------------------------------------------------------------------------------
+# Canal (post-hoc analysis) rules, CLASSIC, per finished run. Each takes ONE run dir and
+# writes its canal output back into that dir. The input is _CANAL_INPUT_REL, whichever
+# file certifies that atoms.parquet + a COMPLETE metrics.json exist: in inline mode that
+# is metrics.json, written last by training; in deferred mode training writes only a stub,
+# so it is the completion's sentinel instead.
+#
+# CPU-only (gpus=0 -> the `compute` partition): the classic canals read the run's own
+# atoms/predictions, with no g* truncated sum. Non-blocking by construction, since a canal
+# produces its own file and never the training's, so under --keep-going a canal failure is
+# isolated: rerun just that canal.
+#
+# The {leaf} wildcard absorbs the model_type PLUS the optional /lambda_x/ segment, so ONE
+# rule per canal covers both path shapes. The constraints pin every segment: run_id_classic
+# to RUN_ID_CLASSIC, so the rule never reaches an ensemble or GCM tree, radius to r<digits>,
+# and leaf to a single model_type optionally followed by /lambda_x, so an ensemble member's
+# /seed_x/ segment cannot match either.
+_CANAL_RUNDIR = "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{leaf}"
+
+# NOTE: _CANAL_RUNDIR (bare {wildcard} braces) is valid in input/output/params -- Snakemake
+# fills the wildcards there. It is NOT valid inside a shell string, where a bare {dataset}
+# raises NameError; so the run dir is exposed as params.rundir and the shell references
+# {params.rundir}.
+rule canal1_classic:
+    input:
+        _CANAL_RUNDIR + _CANAL_INPUT_REL
+    output:
+        _CANAL_RUNDIR + "/benchmark_summary.json"
+    params:
+        rundir = _CANAL_RUNDIR
+    wildcard_constraints:
+        run_id_classic = RUN_ID_CLASSIC,
+        radius         = r"r[0-9]+",
+        leaf           = r"[^/]+(/lambda_[^/]+)?",
+    resources:
+        # atoms.parquet read (cheap) + slide-aware aggregation; small memory.
+        time = "00:20:00", cpus = 2, mem_mb = 16000, gpus = 0, partition = "compute",
+    shell:
+        "python -u snake/scripts/canals/canal1_benchmark_summary_precompute.py "
+        "  --run-dir {params.rundir}"
+
+rule canal2_classic:
+    input:
+        _CANAL_RUNDIR + _CANAL_INPUT_REL
+    output:
+        # summary.json is the universal sentinel: written LAST in the normal path AND the
+        # only file the graceful no-uncertainty exit writes (msemeanonly / homoscedastic,
+        # which have no per-spot uncertainty, so gene_partial.parquet is never produced for
+        # them). Declaring it avoids a MissingOutputException on those models and makes a
+        # mid-run crash leave no stale sentinel.
+        _CANAL_RUNDIR + "/canal2_uncertainty/summary.json"
+    params:
+        rundir = _CANAL_RUNDIR
+    wildcard_constraints:
+        run_id_classic = RUN_ID_CLASSIC,
+        radius         = r"r[0-9]+",
+        leaf           = r"[^/]+(/lambda_[^/]+)?",
+    resources:
+        # canal2 melts the per-fold predictions into a per-(spot,gene) long dataframe, so
+        # its peak memory scales with n_spots x n_genes, far above canal1 and canal3.
+        time = "02:00:00", cpus = 2, mem_mb = 128000, gpus = 0, partition = "compute",
+    shell:
+        # run-dir mode: exactly one uncertainty estimate, so NO --uncertainty-source.
+        "python -u snake/scripts/canals/canal2_uncertainty_precompute.py "
+        "  --run-dir {params.rundir}"
+
+rule canal3_classic:
+    input:
+        _CANAL_RUNDIR + _CANAL_INPUT_REL
+    output:
+        _CANAL_RUNDIR + "/canal3_zero_detection/summary.json"
+    params:
+        rundir = _CANAL_RUNDIR
+    wildcard_constraints:
+        run_id_classic = RUN_ID_CLASSIC,
+        radius         = r"r[0-9]+",
+        leaf           = r"[^/]+(/lambda_[^/]+)?",
+    resources:
+        time = "00:30:00", cpus = 2, mem_mb = 32000, gpus = 0, partition = "compute",
+    shell:
+        "python -u snake/scripts/canals/canal3_zero_detection_precompute.py "
+        "  --run-dir {params.rundir}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLASSIC deferred-metrics rules (design + gate: see the deferred-chain block next to the
+# target lists). Placed HERE, after the canals, only because they reuse _CANAL_RUNDIR,
+# which the canal section defines. Both are INERT when compute_final_metrics is True:
+# nothing requests their outputs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# g* precompute, one job per (run, fold), because each preds_fold{k}.h5ad is independent
+# on disk. It runs on GPU because count_expected_log1p is much slower on CPU.
+# --splits val,test because a classic preds_fold{k}.h5ad holds both splits and
+# metrics.json reports both; with the default, test only, the completion would recompute
+# the val g* on CPU.
+#
+# The input is model.pt rather than metrics.json, and that choice is load-bearing. The
+# completion rewrites metrics.json in place and runs strictly after these g* files, so
+# metrics.json ends up permanently newer than every gstar_fold{k}.h5ad. Under
+# --rerun-triggers mtime, which these runs are launched with, the next
+# invocation would then re-fire every g* job and cascade into the completions and canals.
+# ancient(metrics.json) is the wrong fix: it also stops a re-trained run from re-firing
+# g*, which pairs fresh predictions with a stale companion, so silently wrong numbers
+# instead of wasted compute. model.pt has neither problem, and train.py copies it last,
+# so every preds_fold*.h5ad exists by the time this job starts.
+#
+# The per-fold predictions file is an undeclared side-output of training, so it is passed
+# as a param instead of a tracked input. {k} is enumerated over range(K) in the target list.
+rule gstar_classic:
+    input:
+        run = "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/model.pt",
+    output:
+        gstar = "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/predictions/gstar_fold{k}.h5ad",
+    params:
+        pred_file = "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/predictions/preds_fold{k}.h5ad",
+    wildcard_constraints:
+        run_id_classic = RUN_ID_CLASSIC,
+        model_type     = _classic_count_constraint,   # count-only: DE_gstar_precompute raises on a non-count target
+        radius         = r"r[0-9]+",
+        k              = r"\d+",
+    resources:
+        # time: see the g* wall-time note next to the target lists. Runtime is not
+        # predictable at DAG-build time, so the request is flat and deliberately generous;
+        # a job that exits in seconds costs only backfill priority, while a timeout wastes
+        # the fold. mem stays flat because the marching window is gene-chunked, so a wider
+        # window costs time, not memory.
+        time = "02:00:00", cpus = 2, mem_mb = 32000, gpus = 1, partition = "gpu",
+    log:
+        "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/logs/gstar_fold{k}.log"
+    shell:
+        # --out-file == the default sibling path (preds_ -> gstar_), passed explicitly so the
+        # declared output cannot drift from what the script writes -- same reason as the
+        # ensemble rule. --device cuda: this is the GPU rule, and g* on GPU is the point.
+        "python -u snake/scripts/epistemic/DE_gstar_precompute.py "
+        "  --pred-file {params.pred_file} --out-file {output.gstar} --device cuda "
+        "  --splits val,test "
+        "  2>&1 | tee {log}"
+
+
+# Metric completion: the CPU per-(slide,gene) scipy pass, the native-CDF PIT and the
+# atoms.parquet that compute_final_metrics=False leaves undone. One job per run, not per
+# fold, because the aggregation is slide-aware across folds. CPU-only, gpus=0 sending it
+# to the `compute` partition.
+#
+# The wildcard is {leaf}, not {model_type}, because the completion covers every family and
+# the Gaussians carry a /lambda_x segment. is_count_model therefore reads the model type
+# back out of it as wc.leaf.split("/")[0].
+#
+# For count models the g* files are a hard input. That guards ordering, since the companion
+# must exist before the completion reads it, and cost: without it load_gstar_companion
+# returns {} and the completion silently falls back to recomputing g* on CPU.
+#
+# The output is a sentinel and never metrics.json. The script rewrites metrics.json in
+# place, so declaring it as an output would leave the output newer than its own input and
+# re-fire the job on every invocation under --rerun-triggers mtime. For the same reason
+# `touch` runs after the script, so the sentinel ends up newer than the metrics.json it
+# rewrote.
+rule complete_classic_metrics:
+    input:
+        metrics = _CANAL_RUNDIR + "/metrics.json",
+        gstar   = lambda wc: (
+            expand("results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{leaf}/predictions/gstar_fold{k}.h5ad",
+                   dataset=[wc.dataset], run_id_classic=[wc.run_id_classic],
+                   gene_set=[wc.gene_set], radius=[wc.radius], leaf=[wc.leaf],
+                   k=_classic_folds(wc.dataset))
+            if is_count_model(wc.leaf.split("/")[0]) else []),
+    output:
+        sentinel = _CANAL_RUNDIR + "/" + CLASSIC_METRICS_SENTINEL
+    params:
+        rundir = _CANAL_RUNDIR
+    wildcard_constraints:
+        run_id_classic = RUN_ID_CLASSIC,
+        radius         = r"r[0-9]+",
+        leaf           = r"[^/]+(/lambda_[^/]+)?",
+    resources:
+        # Deliberately wide: this rule rebuilds the atoms from the full per-fold
+        # predictions, unlike canal1_classic, which reads a pre-aggregated atoms.parquet.
+        time = "04:00:00", cpus = 2, mem_mb = 128000, gpus = 0, partition = "compute",
+    log:
+        _CANAL_RUNDIR + "/logs/complete_metrics.log"
+    shell:
+        "python -u snake/scripts/complete_deferred_metrics.py {params.rundir} 2>&1 | tee {log} "
+        "&& touch {output.sentinel}"
+
+
+# ------------------------------------------------------------------------------
+# Canal rules, ENSEMBLE (--ensemble-dir mode), per combined test_summaries.h5ad. The
+# sentinel input is the combine output; for COUNT models it already carries the
+# g*/pit/zero_prob layers, because combine depends on the g* jobs. Family applicability is
+# enforced by the TARGET lists, so no canal is requested for a family that would raise.
+# run_id_classic is pinned to ENS_CLASSIC_RUNID and the path carries an extra /ensemble/
+# segment, so these are disjoint from the canal*_classic rules above. CPU-only. Bare
+# {wildcard} braces are invalid in a shell string, so the dir goes through params.ens_dir.
+# ------------------------------------------------------------------------------
+_ENS_CANALDIR = "results/{dataset}/{run_id_classic}/{gene_set}/{radius}/{model_type}/ensemble"
+
+# canal1 covers every ensembled family. The mean-only baseline gets pearson alone, the
+# Gaussians pearson plus the PIT triple, and the count heads g*.
+# The model_type constraint below and the c1 expand in _classic_ensemble_canal_targets must
+# be widened together. Widening only the targets leaves the rule unable to match them;
+# widening only the rule leaves nothing requesting it.
+rule canal1_ensemble:
+    input:
+        _ENS_CANALDIR + "/test_summaries.h5ad"
+    output:
+        _ENS_CANALDIR + "/benchmark_summary.json"
+    params:
+        ens_dir = _ENS_CANALDIR
+    wildcard_constraints:
+        run_id_classic = ENS_CLASSIC_RUNID,
+        model_type     = _ens_classic_model_constraint,
+        radius         = r"r[0-9]+",
+    resources:
+        # An ensemble has no atoms.parquet, so this rebuilds the per-(slide,gene) atoms
+        # from the full test_summaries.h5ad, which is far heavier than reading one.
+        time = "01:00:00", cpus = 2, mem_mb = 64000, gpus = 0, partition = "compute",
+    shell:
+        "python -u snake/scripts/canals/canal1_benchmark_summary_precompute.py "
+        "  --ensemble-dir {params.ens_dir}"
+
+# canal2 covers all families, fanned out over the three uncertainty sources, one subdir
+# each. msemeanonly is the one early exit (no pred_var layer, so canal2 is structurally not
+# applicable), and that exit still writes summary.json, so the declared output exists for
+# every (model, source) pair.
+rule canal2_ensemble:
+    input:
+        _ENS_CANALDIR + "/test_summaries.h5ad"
+    output:
+        _ENS_CANALDIR + "/canal2_uncertainty/{source}/summary.json"
+    params:
+        ens_dir = _ENS_CANALDIR
+    wildcard_constraints:
+        run_id_classic = ENS_CLASSIC_RUNID,
+        model_type     = _ens_classic_model_constraint,
+        radius         = r"r[0-9]+",
+        source         = r"total|aleatoric|epistemic",
+    resources:
+        # canal2 melts to a per-(spot,gene) long dataframe, so memory scales with
+        # n_spots x n_genes, much heavier than canal1 or canal3. Same sizing as canal2_classic.
+        time = "02:00:00", cpus = 2, mem_mb = 128000, gpus = 0, partition = "compute",
+    shell:
+        "python -u snake/scripts/canals/canal2_uncertainty_precompute.py "
+        "  --ensemble-dir {params.ens_dir} --uncertainty-source {wildcards.source}"
+
+# canal3 covers all families. Count models need the zero_prob layer, which the combine
+# writes only when the g* files exist, and its input dependency on them guarantees that.
+rule canal3_ensemble:
+    input:
+        _ENS_CANALDIR + "/test_summaries.h5ad"
+    output:
+        _ENS_CANALDIR + "/canal3_zero_detection/summary.json"
+    params:
+        ens_dir = _ENS_CANALDIR
+    wildcard_constraints:
+        run_id_classic = ENS_CLASSIC_RUNID,
+        model_type     = _ens_classic_model_constraint,
+        radius         = r"r[0-9]+",
+    resources:
+        # Like canal1_ensemble, this rebuilds from the full test_summaries.h5ad. It is
+        # lighter than canal1 and canal2: only P(Y=0) per (slide,gene), no float64 melt.
+        time = "01:00:00", cpus = 2, mem_mb = 64000, gpus = 0, partition = "compute",
+    shell:
+        "python -u snake/scripts/canals/canal3_zero_detection_precompute.py "
+        "  --ensemble-dir {params.ens_dir}"
+
+
+# ------------------------------------------------------------------------------
+# GCM (GeneConditionedMLP) training, one GPU per run. Data is VRAM-resident
+# (PairedSharedTensors) and batches are built by an on-device gather, so one GPU saturates
+# the tiny MLP.
+#
+# Two rules mirror the classic kind-based routing:
+#   train_gcm_lamfree   deterministic + prob_no_lam, no lambda in the output path
+#   train_gcm_gaussian  gaussian_lam, with a lambda_ subdir
+# Both call snake/scripts/train_gcm.py, wrapped in the same nvidia-smi GPU monitor as the
+# classic rules. The run_id wildcard is constrained to the known run-id tokens so
+# Snakemake never invents one; the run-spec lookup is keyed by (dataset, run_id).
+# ------------------------------------------------------------------------------
+
+_gcm_run_ids = sorted({r["run_id"] for r in GCM_RUNS + GCM_ENSEMBLE_RUNS})
+_gcm_run_id_constraint = "|".join(_gcm_run_ids) if _gcm_run_ids else "NO_GCM_RUNS_CONFIGURED"
+_gcm_lamfree_constraint  = "|".join(_gcm_lamfree_types)  or "NO_GCM_LAMFREE_MODELS"
+_gcm_gaussian_constraint = "|".join(_gcm_gaussian_types) or "NO_GCM_GAUSSIAN_MODELS"
+
+
+def _gcm_params(wildcards):
+    """Look up the run-spec for this (dataset, run_id) and return CLI flag values."""
+    return GCM_RUN_BY_KEY[(wildcards.dataset, wildcards.run_id)]
+
+
+rule train_gcm_lamfree:
+    input:
+        adata = f"results/{{dataset}}/_preprocessed/{PREPROC_ID}/{{radius}}/adata.h5ad",
+    output:
+        metrics = "results_gcm/{dataset}/{run_id}/{radius}/{model_type}/metrics.json",
+        model   = "results_gcm/{dataset}/{run_id}/{radius}/{model_type}/model.pt",
+    params:
+        dev_gene_set_id    = lambda wc: _gcm_params(wc)["dev_gene_set_id"],
+        gene_emb_id        = lambda wc: _gcm_params(wc)["gene_emb_id"],
+        chrom_split_spec   = lambda wc: _gcm_params(wc)["chrom_spec"],
+        use_projection     = lambda wc: _gcm_params(wc)["use_projection"],
+        permute_embeddings = lambda wc: _gcm_params(wc)["permute_embeddings"],
+        preproc_dir        = f"results/{{dataset}}/_preprocessed/{PREPROC_ID}/{{radius}}",
+        out_dir            = "results_gcm/{dataset}/{run_id}/{radius}/{model_type}",
+        radius_val         = lambda wc: _r_value(wc.radius),
+    wildcard_constraints:
+        run_id     = _gcm_run_id_constraint,
+        model_type = _gcm_lamfree_constraint,
+    resources:
+        time      = get_gcm_train_time,
+        cpus      = 5,
+        mem_mb    = get_gcm_train_mem,
+        gpus      = 1,
+        partition = "gpu",
+    log:
+        "results_gcm/{dataset}/{run_id}/{radius}/{model_type}/logs/train_gcm.log"
+    shell:
+        # lam is required by the CLI but unused for lambda-free models -> dummy 1.0.
+        "LOGDIR=$(dirname {log}); "
+        "GPU_RAW=$LOGDIR/gpu_raw.csv; GPU_SUM=$LOGDIR/gpu_summary.txt; "
+        "nvidia-smi --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.total "
+        "  --format=csv -l 1 > $GPU_RAW & "
+        "NVSMI_PID=$!; trap 'kill $NVSMI_PID 2>/dev/null' EXIT; "
+        "python -u snake/scripts/train_gcm.py "
+        "  --config snake/config/config.yaml "
+        "  --dataset {wildcards.dataset} "
+        "  --dev-gene-set-id {params.dev_gene_set_id} "
+        "  --gene-emb-id {params.gene_emb_id} "
+        "  --chrom-split-spec {params.chrom_split_spec} "
+        "  --use-projection {params.use_projection} "
+        "  --permute-embeddings {params.permute_embeddings} "
+        "  --radius {params.radius_val} "
+        "  --model-type {wildcards.model_type} "
+        "  --lam 1.0 "
+        "  --preprocessed-dir {params.preproc_dir} "
+        "  --output-dir {params.out_dir} "
+        # RC re-raises the TRAINING exit code at the end, so a crash is not masked by
+        # gpu_summarize. The kill + summary still run on failure (see tee note at the top).
+        "  2>&1 | tee {log}; RC=$?; "
+        "kill $NVSMI_PID 2>/dev/null; "
+        "python snake/scripts/gpu_summarize.py $GPU_RAW $GPU_SUM --skip-seconds 20; "
+        "exit $RC"
+
+
+rule train_gcm_gaussian:
+    input:
+        adata = f"results/{{dataset}}/_preprocessed/{PREPROC_ID}/{{radius}}/adata.h5ad",
+    output:
+        metrics = "results_gcm/{dataset}/{run_id}/{radius}/{model_type}/lambda_{lam}/metrics.json",
+        model   = "results_gcm/{dataset}/{run_id}/{radius}/{model_type}/lambda_{lam}/model.pt",
+    params:
+        dev_gene_set_id    = lambda wc: _gcm_params(wc)["dev_gene_set_id"],
+        gene_emb_id        = lambda wc: _gcm_params(wc)["gene_emb_id"],
+        chrom_split_spec   = lambda wc: _gcm_params(wc)["chrom_spec"],
+        use_projection     = lambda wc: _gcm_params(wc)["use_projection"],
+        permute_embeddings = lambda wc: _gcm_params(wc)["permute_embeddings"],
+        preproc_dir        = f"results/{{dataset}}/_preprocessed/{PREPROC_ID}/{{radius}}",
+        out_dir            = "results_gcm/{dataset}/{run_id}/{radius}/{model_type}/lambda_{lam}",
+        radius_val         = lambda wc: _r_value(wc.radius),
+    wildcard_constraints:
+        run_id     = _gcm_run_id_constraint,
+        model_type = _gcm_gaussian_constraint,
+    resources:
+        time      = get_gcm_train_time,
+        cpus      = 5,
+        mem_mb    = get_gcm_train_mem,
+        gpus      = 1,
+        partition = "gpu",
+    log:
+        "results_gcm/{dataset}/{run_id}/{radius}/{model_type}/lambda_{lam}/logs/train_gcm.log"
+    shell:
+        "LOGDIR=$(dirname {log}); "
+        "GPU_RAW=$LOGDIR/gpu_raw.csv; GPU_SUM=$LOGDIR/gpu_summary.txt; "
+        "nvidia-smi --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.total "
+        "  --format=csv -l 1 > $GPU_RAW & "
+        "NVSMI_PID=$!; trap 'kill $NVSMI_PID 2>/dev/null' EXIT; "
+        "python -u snake/scripts/train_gcm.py "
+        "  --config snake/config/config.yaml "
+        "  --dataset {wildcards.dataset} "
+        "  --dev-gene-set-id {params.dev_gene_set_id} "
+        "  --gene-emb-id {params.gene_emb_id} "
+        "  --chrom-split-spec {params.chrom_split_spec} "
+        "  --use-projection {params.use_projection} "
+        "  --permute-embeddings {params.permute_embeddings} "
+        "  --radius {params.radius_val} "
+        "  --model-type {wildcards.model_type} "
+        "  --lam {wildcards.lam} "
+        "  --preprocessed-dir {params.preproc_dir} "
+        "  --output-dir {params.out_dir} "
+        # RC re-raises the TRAINING exit code at the end, so a crash is not masked by
+        # gpu_summarize. The kill + summary still run on failure (see tee note at the top).
+        "  2>&1 | tee {log}; RC=$?; "
+        "kill $NVSMI_PID 2>/dev/null; "
+        "python snake/scripts/gpu_summarize.py $GPU_RAW $GPU_SUM --skip-seconds 20; "
+        "exit $RC"
+
+
+# ------------------------------------------------------------------------------
+# GCM deep-ensemble member, the GCM analog of train_ensemble_member.
+#
+# It follows train_gcm_gaussian with three differences: the path segment is /seed_{seed}/
+# instead of /lambda_{lam}/, --lam is the constant ENSEMBLE_LAMBDA, and --seed is passed.
+# The training loop seeds fold k with seed+fold, so a member seed varies initialization and
+# batch shuffling while the splits stay fixed. Scope is ENS_GCM_MODELS over the runs in
+# GCM_ENSEMBLE_RUNS; one rule covers every model kind in that list, because the loss
+# receives lam only when the spec's uses_lam is True.
+# ------------------------------------------------------------------------------
+rule train_gcm_ensemble_member:
+    input:
+        adata = f"results/{{dataset}}/_preprocessed/{PREPROC_ID}/{{radius}}/adata.h5ad",
+    output:
+        metrics = "results_gcm/{dataset}/{run_id}/{radius}/{model_type}/seed_{seed}/metrics.json",
+        model   = "results_gcm/{dataset}/{run_id}/{radius}/{model_type}/seed_{seed}/model.pt",
+    params:
+        dev_gene_set_id    = lambda wc: _gcm_params(wc)["dev_gene_set_id"],
+        gene_emb_id        = lambda wc: _gcm_params(wc)["gene_emb_id"],
+        chrom_split_spec   = lambda wc: _gcm_params(wc)["chrom_spec"],
+        use_projection     = lambda wc: _gcm_params(wc)["use_projection"],
+        permute_embeddings = lambda wc: _gcm_params(wc)["permute_embeddings"],
+        preproc_dir        = f"results/{{dataset}}/_preprocessed/{PREPROC_ID}/{{radius}}",
+        out_dir            = "results_gcm/{dataset}/{run_id}/{radius}/{model_type}/seed_{seed}",
+        radius_val         = lambda wc: _r_value(wc.radius),
+        lam                = ENSEMBLE_LAMBDA,
+    wildcard_constraints:
+        run_id     = _gcm_run_id_constraint,
+        model_type = _ens_gcm_model_constraint,
+        seed       = r"\d+",
+    resources:
+        time      = get_gcm_train_time,
+        cpus      = 5,
+        mem_mb    = get_gcm_train_mem,
+        gpus      = 1,
+        partition = "gpu",
+    log:
+        "results_gcm/{dataset}/{run_id}/{radius}/{model_type}/seed_{seed}/logs/train_gcm.log"
+    shell:
+        "LOGDIR=$(dirname {log}); "
+        "GPU_RAW=$LOGDIR/gpu_raw.csv; GPU_SUM=$LOGDIR/gpu_summary.txt; "
+        "nvidia-smi --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.total "
+        "  --format=csv -l 1 > $GPU_RAW & "
+        "NVSMI_PID=$!; trap 'kill $NVSMI_PID 2>/dev/null' EXIT; "
+        "python -u snake/scripts/train_gcm.py "
+        "  --config snake/config/config.yaml "
+        "  --dataset {wildcards.dataset} "
+        "  --dev-gene-set-id {params.dev_gene_set_id} "
+        "  --gene-emb-id {params.gene_emb_id} "
+        "  --chrom-split-spec {params.chrom_split_spec} "
+        "  --use-projection {params.use_projection} "
+        "  --permute-embeddings {params.permute_embeddings} "
+        "  --radius {params.radius_val} "
+        "  --model-type {wildcards.model_type} "
+        "  --lam {params.lam} "
+        "  --seed {wildcards.seed} "
+        "  --preprocessed-dir {params.preproc_dir} "
+        "  --output-dir {params.out_dir} "
+        # RC re-raises the TRAINING exit code at the end, so a crash is not masked by
+        # gpu_summarize. The kill + summary still run on failure (see tee note at the top).
+        "  2>&1 | tee {log}; RC=$?; "
+        "kill $NVSMI_PID 2>/dev/null; "
+        "python snake/scripts/gpu_summarize.py $GPU_RAW $GPU_SUM --skip-seconds 20; "
+        "exit $RC"
+
+
+# GCM deep-ensemble combine, the GCM analog of combine_ensemble_classic. It fans in the
+# ENSEMBLE_SEEDS members of one (run_id, radius, model_type) into a single
+# test_summaries.h5ad, using the same script, which reads the model family off
+# metrics.json. Requested by all_ensemble_combine and all_ensemble_combine_gcm, never by
+# all_train_ensemble, so a members launch does not drag it in. Pure read plus numpy, so no GPU
+# monitor.
+#
+# There is no GCM g* rule, so this has no g* input, unlike combine_ensemble_classic. A
+# count model ensembled here gets a test_summaries.h5ad with no gstar, pit or zero_prob
+# layers: the combine writes those only when it finds gstar_fold*.h5ad beside the member
+# predictions.
+rule combine_ensemble_gcm:
+    input:
+        members = lambda wc: expand(
+            "results_gcm/{dataset}/{run_id}/{radius}/{model_type}/seed_{seed}/metrics.json",
+            dataset=[wc.dataset], run_id=[wc.run_id], radius=[wc.radius],
+            model_type=[wc.model_type], seed=ENSEMBLE_SEEDS),
+    output:
+        summary = "results_gcm/{dataset}/{run_id}/{radius}/{model_type}/ensemble/test_summaries.h5ad",
+    params:
+        model_dir = "results_gcm/{dataset}/{run_id}/{radius}/{model_type}",
+        seeds     = ENSEMBLE_SEEDS_CSV,
+    wildcard_constraints:
+        run_id     = _gcm_run_id_constraint,
+        model_type = _ens_gcm_model_constraint,
+    resources:
+        # CPU-only: gpus=0 with partition=compute lands the job on a CPU node. GCM
+        # predictions are large, so the budget is deliberately generous.
+        time = "02:00:00", cpus = 2, mem_mb = 128000, gpus = 0, partition = "compute",
+    shell:
+        # NO redirect: timing prints flow to the SLURM job stdout ->
+        # snake/logs/slurm_combine_ensemble_gcm_<jobid>.out (find it by job id).
+        "python -u snake/scripts/epistemic/deep_ensemble_combine.py "
+        "  --model-dir {params.model_dir} --seeds {params.seeds}"

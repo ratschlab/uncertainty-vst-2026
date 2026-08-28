@@ -1,0 +1,540 @@
+# snake/config/config.yaml
+#
+# Single source of truth for every experiment parameter of both pipelines:
+#   classic  one multi-output MLP per gene set (out_dim = n_genes, no gene embeddings)
+#   GCM      gene-conditioned MLP: a gene embedding is concatenated to the spot
+#            embedding, so the model can be evaluated on genes never seen in training
+#
+# Two version labels drive the output paths, and neither is inferred from the code:
+#   preproc_id      versions the shared preprocessing:
+#                   results/{ds}/_preprocessed/{preproc_id}/r{NN}/
+#   run_id_classic  versions the training outputs:
+#                   results/{ds}/{run_id_classic}/{gene_set}/r{NN}/{model_type}/
+# Bump them by hand whenever a parameter or a piece of logic changes that does NOT
+# already appear in the path. Snakemake's mtime trigger does not catch a code change,
+# so a stale directory would otherwise be reused silently.
+#
+# Any list-valued key named *_values is a SWEEP AXIS: one run per combination.
+
+# -- Paths ---------------------------------------------------------------------
+# Shared project root (contains src/, data/, snake/). Everything relative resolves
+# under it. Every /path/to/... below is a placeholder and has to be set first.
+project_root: "/path/to/project/"
+
+# -- Preprocessing version -----------------------------------------------------
+# Bump on any preprocessing change (normalization, HVG settings, ground-truth KNN
+# imputation, batch key, slide list). The preprocessed adata is shared across ALL
+# training run_ids and BOTH pipelines, which is why it is versioned separately.
+preproc_id: "v5"
+
+# -- Datasets ------------------------------------------------------------------
+# Per dataset:
+#   count_common_depth  target depth T for the count models. depth_scale = T/1e4 is
+#                       the only surviving constant: it builds the cp target and is
+#                       the divisor applied before log1p when reporting the mean
+#                       correlation. It is None for the depth-blind *_raw models.
+#   parent_dir          root of the per-slide .h5ad files
+#   h5ad_subdir         subdirectory under parent_dir ("" if they sit directly there)
+#   emb_base_dir        H&E patch embeddings
+#   emb_subdir          which extraction under emb_base_dir to read; {radius} is filled in
+#   samples_file        one slide/sample id per line
+#   test_donors         read ONLY by cv.strategy: fixed_holdout_kfold; ignored by LOPO
+#   gene_sets           classic pipeline only, {set_id: inline list | path}. A leading
+#                       underscore marks a multi-gene set. Paths are project-root
+#                       relative on purpose, so they follow project_root.
+# The GCM ignores gene_sets entirely; see gcm.dev_gene_sets.
+#
+# The paper calls the three cohorts by other names: 10x_TuPro is "Tumor Profiler",
+# TLS is "Kidney/Lung TLS", LUNG_CANCER is "NSCLC".
+#
+# Rough sizes: 10x_TuPro   18 slides, 7 donors, 77k spots, 17k genes shared by all slides
+#              TLS          6 slides, one donor per slide, 19k spots, 18k shared genes
+#              LUNG_CANCER 36 slides, 8 donors, LUAD + LUSC merged
+datasets:
+  10x_TuPro:
+    count_common_depth: 25000
+    parent_dir:   "/path/to/st-data/10x_TuPro/out_all_genes/data/"
+    h5ad_subdir:  "h5ad/"
+    emb_base_dir: "/path/to/project/patch_embeddings/10x_TuPro/"
+    emb_subdir:   "embeddings_radius_factor_{radius}_swapxy_True_2/"
+    samples_file: "/path/to/project/data/slide_sample_list_10x_TuPro.txt"
+    test_donors:  [MANOFYB]   # fixed_holdout_kfold only; ignored by LOPO
+    gene_sets:
+      _10x_TuPro_hvg_top3000: "results/10x_TuPro/_preprocessed/{preproc_id}/r75/hvg/hvg_top3000.txt"
+  TLS:
+    count_common_depth: 10000
+    parent_dir:   "/path/to/project/TLS_VISIUM_USZ/h5ad_preprocessed/"
+    h5ad_subdir:  ""
+    emb_base_dir: "/path/to/project/patch_embeddings/TLS/"
+    emb_subdir:   "embeddings_radius_factor_{radius}_swapxy_True_2/"
+    samples_file: "/path/to/project/data/slide_sample_list_TLS.txt"
+    test_donors:  [LC1]   # fixed_holdout_kfold only; ignored by LOPO
+    gene_sets:
+      _TLS_hvg_top3000: "results/TLS/_preprocessed/{preproc_id}/r75/hvg/hvg_top3000.txt"
+  LUNG_CANCER:
+    count_common_depth: 10000
+    parent_dir:   "/path/to/project/data_merged/LUNG_CANCER/"
+    h5ad_subdir:  "h5ad/"
+    emb_base_dir: "/path/to/project/patch_embeddings/LUNG_CANCER/"
+    emb_subdir:   "embeddings_radius_factor_{radius}_swapxy_True/"
+    samples_file: "/path/to/project/data/slide_sample_list_LUNG_CANCER.txt"
+    test_donors:  [P19]   # fixed_holdout_kfold only; ignored by LOPO
+    gene_sets:
+      _LUNG_CANCER_hvg_top3000: "results/LUNG_CANCER/_preprocessed/{preproc_id}/r75/hvg/hvg_top3000.txt"
+
+# Which datasets to build Snakemake targets for.
+dataset_values:
+  - 10x_TuPro
+  - TLS
+  - LUNG_CANCER
+
+# HVG selections computed and saved (one gene-list file per N) in the SINGLE
+# preprocess run. Not a path wildcard: the normalized matrix is identical across N,
+# so every N is flagged in one pass.
+n_top_values:
+  - 10
+  - 50
+  - 100
+  - 500
+  - 1000
+  - 2000
+  - 3000
+  - 4000
+  - 5000
+  - 6000
+  - 7000
+  - 8000
+  - 9000
+  - 10000
+  - 11000
+  - 12000
+  - all
+
+# Batch key for seurat_v3 HVG selection (must exist in each slide's obs).
+hvg_batch_key: "sample_id"
+
+# -- Classic pipeline sweep axes -----------------------------------------------
+# Patch radius, in units of the spot diameter. Drives the r{NN} path segment.
+radius_values:
+  - 0.75
+
+# Everything that varies by model type (class, loss, target_source, extraction) is
+# declared in src/models/specs.py. Listed below is every type that can be trained.
+#
+# The paper names these models differently. Paper name on the left:
+#   mean-only            msemeanonly
+#   Gene-homoscedastic   homoscedastic         <- the "gene-" prefix is dropped here, and
+#                                                 spot_homoscedastic is a DIFFERENT model
+#   Spot-homoscedastic   spot_homoscedastic
+#   Heteroscedastic      heteroscedastic
+#   Poisson              poisson_cp
+#   Negative binomial    negativebinomial_hetero_noanchor_cp
+#   STimage              STI_nb_cp, STI_nb_raw
+#
+# _noanchor names a free dispersion: log_mu and log_alpha each have their own head, per
+# (spot, gene), trained with the plain NB likelihood, with nothing tying the dispersion
+# to a per-gene value.
+# The spotdisp and genedisp variants restrict where the dispersion may vary. They are
+# not reported in the paper.
+model_types:
+  # Gaussian / MSE family, trained on log1p(CP10k). Swept over lambda_values.
+  - msemeanonly
+  - homoscedastic
+  - heteroscedastic
+  - spot_homoscedastic
+  # Counts on the common-depth ROUNDED target round(CP_T), reported on log1p(CP10k).
+  - poisson_cp
+  - negativebinomial_hetero_noanchor_cp
+  - negativebinomial_spotdisp_cp
+  - negativebinomial_genedisp_cp
+  # Same, UNROUNDED (nr = no rounding) target CP_T, same reporting axis. 
+  - poisson_cp_nr
+  - negativebinomial_hetero_noanchor_cp_nr
+  - negativebinomial_spotdisp_cp_nr
+  - negativebinomial_genedisp_cp_nr
+  # Raw counts, reported on log1p(raw counts). A different axis, so these numbers are
+  # never comparable to the ones above: report them in their own table.
+  - poisson_raw
+  - negativebinomial_hetero_noanchor_raw
+  # STimage benchmark head (bare Linear readout). Classic only.
+  - STI_nb_cp
+  - STI_nb_raw
+
+# beta-NLL exponent (Seitzer et al. 2022): loss = stopgrad(var)^lam * gaussian_nll,
+# see src/training/losses.py. lam=0.0 is the plain NLL. 
+# Applies only to uses_lam=True specs (the Gaussians) and adds a /lambda_{lam}/ path segment.
+lambda_values:
+  - 0.0
+  - 0.25
+  - 0.5
+  - 0.75
+  - 1.0
+
+# -- Count-model knobs ---------------------------------------------------------
+# Initial log-dispersion for the NB models. -2.0 starts them near Poisson.
+nb_log_alpha_init: -2.0
+
+# -- Preprocessing steps -------------------------------------------------------
+# Per-slide CP10k normalization, then log1p. Scaling stays off: the models are
+# trained on log1p(CP10k) directly.
+normalize: true
+log: true
+scaling: false
+
+# -- Training run version ------------------------------------------------------
+# Versions the training output tree. 
+run_id_classic: "pr_classic3"
+
+# Every run id the notebooks and the launchers refer to, and the change that produces it. Only
+# one value is live at a time, the one set above. The others are reproduced by making the change
+# named below and launching again.
+#
+# A fresh run id is mandatory for any of these: none of the keys involved is part of the output
+# path, and Snakemake compares file times, so it would not notice an edit to this file and would
+# reuse the previous run's outputs.
+#
+#   run_id                          what it is
+#   ------------------------------  ------------------------------------------------------------
+#   CLASSIC PIPELINE (run_id_classic, above)
+#   pr_classic3                     the headline sweep: every figure and table of the paper that
+#                                   is not about an ensemble reads this one. It is the state of
+#                                   this file.
+#   pr_classic1                     an independent re-run of the pr_classic3 sweep. The MC-dropout and
+#                                   Laplace post-hoc summaries are computed on this one.
+#   pr_classic4_vloss_v1            pr_classic3 with early_stop_criterion: corr -> val_loss.
+#                                   A sensitivity arm: by how much the epoch selection rule moves
+#                                   the result. Never a headline number.
+#   pr_classic7_mse_sel             pr_classic3 with early_stop_criterion: corr -> mse. The second
+#                                   arm of the same question. corr against val_loss is circular on
+#                                   the correlation axis, since each criterion wins on its own
+#                                   metric; mse is mean-only, so the comparison is not.
+#   pr_classic6_cp_vs_cp_nr         pr_classic3 plus the four *_cp_nr heads, at the same
+#                                   count_common_depth as above (25000 / 10000 / 10000).
+#   pr_classic5_cp_vs_cp_nr_median  the same heads with count_common_depth set to each cohort's
+#                                   median library size instead: 25000 / 2800 / 1200. The pair
+#                                   5 vs 6 asks whether that choice of depth changes anything.
+#
+#   DEEP ENSEMBLES (ensemble.classic.run_id, further down)
+#   de_6                            the 5-seed ensemble of the classic heads. Source of every
+#                                   ensemble number, and of the epistemic/aleatoric split.
+#   sti_v1                          the two STimage heads (STI_nb_cp, STI_nb_raw) as their own
+#                                   5-seed ensemble. Separate because
+#                                   ensemble.classic.hyperparams applies to a whole run, and the
+#                                   benchmark is trained with the recipe of its own paper, not
+#                                   with the defaults here.
+#
+
+
+# -- Cross-validation (shared by BOTH pipelines) -------------------------------
+# The SPLIT is grouped by DONOR (patient)
+#   lopo_next_val       leave-one-patient-out (LOPO, the acronym used across the code and
+#                       the output files): for each donor i, test = [i], val = the next donor
+#                       in the list, train = the rest. One model per held-out donor, all in
+#                       one job. Needs K >= 3.
+#   fixed_holdout_kfold a fixed test_donors holdout, then GroupKFold(params.k) over
+#                       the rest. The only strategy that reads test_donors.
+# Registry: src/data/splitting.py::cv_donor_folds.
+cv:
+  strategy: lopo_next_val
+  params: {}
+
+# Center the spot embeddings with train-fold statistics; the constants are saved with the checkpoint
+centering_from_train: false
+
+# -- Per-gene target standardization (Gaussian / MSE family only) --------------
+# Standardizes the training target per gene so the predicted uncertainty stops
+# tracking each gene's marginal scale. Location and scale are computed on the fold's
+# TRAIN rows only, saved with the checkpoint, and applied identically to val/test.
+# Loss, metrics AND saved predictions all stay in the standardized space.
+#   none        off
+#   gene_zscore z = (y - mean_g) / scale_g, scale_g = sqrt(mean over train SLIDES of
+#               within-slide variance), which removes between-slide shifts
+#   gene_minmax z = (y - min_g) / (max_g - min_g), per gene over train spots
+target_transform: "none"
+
+# -- Metrics -------------------------------------------------------------------
+# Correlations are computed per (slide, gene) then averaged across slides. 
+# Reported during training. 
+# See src/evaluation/metrics_slide_aware.py.
+#
+# The paper names the metrics differently. Paper name on the left:
+#   calibration error                   ece_pit
+#   signed dispersion                   disp_signed
+#   uncertainty-error correlation       var_residual_corr
+#   the same, controlled for the mean   var_residual_corr_partial
+#
+# A count model predicts a distribution, and the reported number is a mean on the log1p
+# axis. There are two ways to take that mean, and the paper calls them A and B:
+#   estimator A   the *_logmean keys           log1p of the predicted mean
+#   estimator B   g*, or gstar in filenames    the predicted mean of log1p, taken through
+#                                              the whole distribution
+# B is the reported one. A is cheap enough to compute every epoch, so early stopping
+# uses A.
+corr_metrics:
+  - pearson
+
+# Per-epoch TRAIN metric is computed on a fixed seeded subsample per slide, to cut
+# eval cost. null = all train spots. Training itself always uses all spots.
+train_metric_spots_per_slide: null
+
+# -- Base architecture ---------------------------------------------------------
+# Classic pipeline; the GCM inherits this block unless gcm.architecture is set. 
+# It was chosen  by the random search in snake_search/, which found the architecture
+#  to be within noise across the space. 
+architecture:
+  hidden_dims: [1024, 256]
+  dropout:     0.1
+  activation:  relu
+
+# -- Training hyperparameters --------------------------------------------------
+lr: 8e-4         
+weight_decay: 0.0
+batch_size: 512  
+max_epochs: 25
+patience: 5
+
+# Which validation scalar picks the epoch. classic pipeline only
+#   corr      maximize corr_metrics[0] on val (the default, and every headline run)
+#   val_loss  minimize the validation loss, i.e. the model's own objective
+#   mse       minimize the validation MSE on the axis the correlation is reported on
+early_stop_criterion: corr
+
+# Global reproducibility random seed
+seed: 42
+
+# Large-batch stabilizers. warmup_epochs ramps the lr linearly over the first N epochs
+warmup_epochs: 3
+# grad_clip_norm is a per-step global grad-norm clip (null = off).
+grad_clip_norm: null
+
+# Allow TF32 / "high" float32 matmul on Ampere+ GPUs: faster Linear layers for a small
+# precision cost.
+matmul_tf32: true
+
+# Also score the held-out TEST slides every epoch and add test_* columns to the
+# learning curves, so the generalization gap can be plotted. 
+# Diagnostic only: the test set is never used for selection. 
+log_test_curve: false
+
+# Write learning_curves/fold{k}.csv.
+save_learning_curves: True
+
+# The NB native CDF is the one expensive per-epoch metric. When true, NB models log the
+# PIT triple every epoch on the VAL pass only. Gaussian and Poisson per-epoch
+# calibration are cheap and always on. Final inference always writes the exact NB
+# calibration regardless.
+nb_per_epoch_calibration: true
+
+# -- Fold-end behavior (SHARED by both pipelines) -----------------------------
+# compute_final_metrics runs the per-fold final inference and writes atoms.parquet +
+# metrics.json + the LOPO headline.
+# Dominant fold end CPU work that can hold a GPU.
+# FALSE switches the classic DAG to the deferred chain (train -> g* on GPU -> CPU
+# completion -> canals) and then REQUIRES save_predictions: True.
+compute_final_metrics: False
+save_predictions: True
+
+# ==============================================================================
+# Deep-ensemble sweep (epistemic uncertainty)
+# ==============================================================================
+# M members trained on IDENTICAL data, differing only by weight init and batch shuffle
+# (the --seed CLI arg). 
+# The CV partition takes no RNG, so every member shares the same donor split by construction.
+#   epistemic = var_m(mean), aleatoric = mean_m(var), total = the sum,
+#   point prediction = the mixture mean = mean_m(mean)
+# Each member is a full run; the only differences are --seed and a trailing
+# /seed_{seed}/ path segment so the members coexist.
+ensemble:
+  seed_values: [0, 1, 2, 3, 4]
+  lambda:      0.0 # beta-NLL exponent
+
+  classic:
+    run_id:        "de_6"
+    # Same legal set as the top-level model_types.
+    model_types:
+      - msemeanonly
+      - homoscedastic
+      - heteroscedastic
+      - spot_homoscedastic
+      - poisson_cp
+      - negativebinomial_hetero_noanchor_cp
+      - negativebinomial_spotdisp_cp
+      - negativebinomial_genedisp_cp
+      - poisson_cp_nr
+      - negativebinomial_hetero_noanchor_cp_nr
+      - negativebinomial_spotdisp_cp_nr
+      - negativebinomial_genedisp_cp_nr
+      - poisson_raw
+      - negativebinomial_hetero_noanchor_raw
+      - STI_nb_cp
+      - STI_nb_raw
+    radius_values: [0.75]
+    # Overrides of the top-level training keys, for ensemble members only.
+    # compute_final_metrics MUST be set explicitly to false here: the member metrics
+    # come from the post-hoc g* -> combine -> canals chain instead.
+    # The STimage benchmark is trained with the recipe of its own paper rather than these
+    # defaults, its head AND its hyperparameters both differing. To reproduce it, set
+    # run_id to a fresh value, list STI_nb_cp / STI_nb_raw alone in model_types above, and
+    # add to this block:
+    #   lr: 1e-4
+    #   batch_size: 128
+    #   max_epochs: 100
+    #   patience: 10
+    #   warmup_epochs: 0
+    #   early_stop_criterion: val_loss
+    # The block applies to the WHOLE run, so those values would train every other head listed in
+    # model_types as well; hence the fresh run_id.
+    hyperparams:
+      compute_final_metrics: false
+      early_stop_criterion: corr
+
+  gcm:
+    run_id_gcm:    "de_3"
+    # GCM-capable types only: STI_nb_cp / STI_nb_raw have gcm_head=None in specs.py
+    # and would fail fast here.
+    model_types:
+      - msemeanonly
+      - homoscedastic
+      - heteroscedastic
+      - spot_homoscedastic
+      - poisson_cp
+      - negativebinomial_hetero_noanchor_cp
+      - negativebinomial_spotdisp_cp
+      - negativebinomial_genedisp_cp
+      - poisson_cp_nr
+      - negativebinomial_hetero_noanchor_cp_nr
+      - negativebinomial_spotdisp_cp_nr
+      - negativebinomial_genedisp_cp_nr
+      - poisson_raw
+      - negativebinomial_hetero_noanchor_raw
+    radius_values: [0.75]
+
+# ==============================================================================
+# GCM pipeline (gene-conditioned MLP)
+# ==============================================================================
+# A spot backbone produces q per spot, a gene hypernetwork turns each gene embedding
+# into that gene's readout head (w_j, b_j), and y_hat[s,j] = q_s . w_j / sqrt(D) + b_j.
+# The whole gene set is predicted per spot, so the model extends to unseen genes.
+#
+# Two independent generalization axes:
+#   spots  donor-level outer CV, from the shared cv: block above
+#   genes  ONE fixed chromosome split (test / val / train), reused for every donor
+#          fold. The per-fold headline is test donor x test-heldout genes.
+gcm:
+  # The GCM run_id is
+  #   "{run_id_gcm}__{dev_gene_set_id}__{chrom_split}__{gene_emb}__proj{0,1}__perm{0,1}"
+  run_id_gcm: "gcm_v1"
+
+  # dataset -> {dev_gene_set_id: gene list}, either a path (one gene per line,
+  # {preproc_id} allowed, relative paths resolve under project_root) or an inline list.
+  # Each (dataset, dev_gene_set_id) is its OWN run and the id is the first token of
+  # run_id. Must be multi-gene: the GCM needs a chromosome split.
+  # GAM in the file names below is the former name of the GCM; the lists were written
+  # under it and keep it.
+  dev_gene_sets:
+    10x_TuPro:
+      _10x_TuPro_hvgall_w_emb_and_chrom_: "/path/to/project/data/space/hvg/10x_TuPro_hvg_topall_GAM_genes_with_network_512d_embedding_and_chromosome.txt"
+    TLS:
+      _TLS_hvgall_w_emb_and_chrom_: "/path/to/project/data/space/hvg/TLS_hvg_topall_GAM_genes_with_network_512d_embedding_and_chromosome.txt"
+    LUNG_CANCER:
+      _LUNG_CANCER_hvgall_w_emb_and_chrom_: "/path/to/project/data/space/hvg/LUNG_CANCER_hvg_topall_GAM_genes_with_network_512d_embedding_and_chromosome.txt"
+
+  gene_chrom_map_path: "data/space/gene_chromosome_map.csv"
+
+  # Gene-level holdout. Each entry is one sweep value and its KEY is the run_id token,
+  # so rename the key if you change the test or the val choice.
+  #   mode: "explicit" + heldout_chroms: [chromosome strings]
+  #   mode: "greedy"   + target_heldout_fraction + greedy_strategy
+  # The val: sub-block selects the validation genes from the remaining train genes:
+  #   random_fraction  a seeded fraction (seed defaults to the top-level seed:, and is
+  #                    independent of the ensemble --seed, so the gene split is frozen
+  #                    across members and across donor folds)
+  #   chroms           whole validation chromosome(s), disjoint from heldout_chroms
+  # Holding out whole chromosomes follows Jaganathan et al. (2019).
+  chrom_split_specs:
+    chr1_3_5_7_9:
+      mode: "explicit"
+      heldout_chroms: ["1", "3", "5", "7", "9"]
+      val:
+        mode: random_fraction
+        fraction: 0.10
+
+  # Short id -> CSV of gene embeddings (one row per gene, first column = gene name).
+  # Each id is one sweep value.
+  gene_embedding_sources:
+    network512: "data/space/network_512d_embeddings_selected_genes.csv"
+
+  # Used only by the gene-embedding permutation sanity check (permute = 1).
+  permutation_seed: 42
+
+  # Readout shape, a sweep axis:
+  #   true   the gene hypernetwork has hidden layer(s), see hyper_hidden
+  #   false  a bilinear readout (a single Linear from gene_dim to the readout params)
+  use_projection_values:
+    - true
+
+  # Hypernetwork size and the spot-axis batch. Each step scores ALL gene-train genes,
+  # so spot_batch_size 512 gives the same effective batch as the classic pipeline.
+  hyper_hidden:           [256]
+  hyper_dropout:          0.0
+  spot_batch_size:        512
+
+  # Sanity check: permute the gene embeddings, which should destroy gene conditioning.
+  permute_embeddings_values:
+    - false
+
+  # Sweep axes, same shape as the classic pipeline.
+  gcm_radius_values:
+    - 0.75
+
+  # GCM-capable types only: those with a gcm_head in src/models/specs.py. The STimage
+  # heads have none, since a bare per-gene readout is undefined for a zero-shot gene set.
+  gcm_model_types:
+    - msemeanonly
+    - homoscedastic
+    - heteroscedastic
+    - spot_homoscedastic
+    - poisson_cp
+    - negativebinomial_hetero_noanchor_cp
+    - negativebinomial_spotdisp_cp
+    - negativebinomial_genedisp_cp
+    - poisson_cp_nr
+    - negativebinomial_hetero_noanchor_cp_nr
+    - negativebinomial_spotdisp_cp_nr
+    - negativebinomial_genedisp_cp_nr
+    - poisson_raw
+    - negativebinomial_hetero_noanchor_raw
+
+  # Same beta-NLL exponent as the classic lambda_values.
+  gcm_lambda_values:
+  - 0.0
+  - 0.25
+  - 0.5
+  - 0.75
+  - 1.0
+
+  # Per epoch, val spots are scored on the gene-TRAIN genes (seen-gene correlation) and
+  # on the gene-VAL genes (new-gene correlation); both are always logged.
+  #   blend       mean(seen, new): good on new spots AND new genes
+  #   seen_genes  seen only: spot generalization
+  #   new_genes   new only: pure gene generalization, the noisiest
+  early_stop_criterion:   new_genes
+
+  # Training hyperparameters, deliberately separate from the classic ones. The batched
+  # model shares the classic regime (it batches over spots and scores all genes per
+  # step), so the lr is anchored on the classic 8e-4.
+  gcm_lr:                 8.0e-4
+  gcm_weight_decay:       1.0e-4
+  warmup_epochs:          3
+  grad_clip_norm:         1.0
+  gcm_max_epochs:         40
+  gcm_patience:           5
+  gcm_centering_from_train: false   # center the spot-embedding block by the train-fold mean
+
+  # Mixed precision. auto detects the dtype from the GPU the job lands on: bf16 on
+  # Ampere+, fp16 on V100/Turing, fp32 below. Force with bf16 | fp16 | off. Only the
+  # train forward is autocast; eval and metrics stay fp32.
+  amp:                    "off"
+
+  # No gcm.seed and no gcm test split here: the GCM reads the top-level seed: and the
+  # per-dataset datasets.{ds}.test_donors, so both pipelines share one source of truth.

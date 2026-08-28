@@ -1,0 +1,37 @@
+# Donor (patient) -> slide mapping.
+#
+# Every train/test split is grouped by DONOR.
+#
+# However, metrics are computed over SLIDE, per-(slide,gene) correlation then nanmean over slides
+#
+# Read by src/data/splitting.py::load_slide_to_donor, and by the Snakefile
+
+10x_TuPro:            # 7 donors, 18 slides
+  MANOFYB: [MANOFYB-1-1, MANOFYB-1-2]
+  MELIPIT: [MELIPIT-1-1, MELIPIT-1-2]
+  MACEGEJ: [MACEGEJ-1-1, MACEGEJ-1-2, MACEGEJ-2-1, MACEGEJ-2-2]
+  MAJOFIJ: [MAJOFIJ-1-1, MAJOFIJ-1-2, MAJOFIJ-2-1, MAJOFIJ-2-2]
+  MAKYGIW: [MAKYGIW-1-1, MAKYGIW-1-2]
+  MAHEFOG: [MAHEFOG-1-1, MAHEFOG-1-2]
+  MIDEKOG: [MIDEKOG-1-1, MIDEKOG-1-2]
+
+LUNG_CANCER:          # LUAD + LUSC together, 8 donors, 36 slides (B=background, T=tumor)
+  P10: [P10-B1, P10-B2, P10-T1, P10-T2, P10-T3, P10-T4]   # LUAD
+  P15: [P15-B1, P15-B2, P15-T1, P15-T2]                   # LUAD
+  P16: [P16-B1, P16-B2, P16-T1, P16-T2]                   # LUAD
+  P24: [P24-B1, P24-B2, P24-T1, P24-T2]                   # LUAD
+  P25: [P25-B1, P25-B2, P25-T1, P25-T2]                   # LUAD
+  P11: [P11-B1, P11-B2, P11-T1, P11-T2, P11-T3, P11-T4]   # LUSC
+  P17: [P17-B1, P17-B2, P17-T1, P17-T2]                   # LUSC
+  P19: [P19-B1, P19-B2, P19-T1, P19-T2]                   # LUSC
+
+TLS:                  # 8 donors, 8 slides 
+                      # 2 excluded below, so 6 donors are used.
+  KC1: [KC1]
+  KC3: [KC3]
+  LC1: [LC1]
+  LC2: [LC2]
+  LC3: [LC3]
+  LC5: [LC5]
+  # KC2: [KC2]   # excluded following previous work (DeepSpot: Leveraging Spatial Context for Enhanced Spatial Transcriptomics Prediction from H&E Images, https://doi.org/10.1101/2025.02.09.25321567)
+  # LC4: [LC4]   # excluded following previous work (DeepSpot: Leveraging Spatial Context for Enhanced Spatial Transcriptomics Prediction from H&E Images, https://doi.org/10.1101/2025.02.09.25321567)

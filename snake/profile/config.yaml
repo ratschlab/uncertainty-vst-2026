@@ -1,0 +1,38 @@
+# snake/profile/config.yaml
+#
+# Snakemake profile SHARED by both pipelines (classic + GCM). SINGLE SOURCE OF
+# TRUTH for the cluster submission command, so that the per-worker SLURM logs
+# ALWAYS land in snake/logs/. The submit-cmd is pipeline-agnostic — it only uses
+# generic {rule} / {resources.*} placeholders, and every rule (classic and GCM)
+# declares time/cpus/partition/gpus/mem_mb. Keeping it in a file rather than on the
+# command line means the submit command cannot be mistyped onto the wrong log dir.
+#
+# Run: pass --profile snake/profile to snakemake, with the target as the last
+# argument. A single output file works as a target too:
+#   snakemake --snakefile snake/Snakefile --configfile snake/config/config.yaml \
+#       --profile snake/profile \
+#       results/10x_TuPro/pr_classic3/_10x_TuPro_hvg_top3000/r75/heteroscedastic/lambda_0.0/metrics.json
+#
+# Logs:
+#   • each worker job's SLURM stdout/err -> snake/logs/slurm_<rule>_<jobid>.{out,err}
+#   • each worker's application log       -> results/.../logs/train_<...>.log (classic)
+#                                            results_gcm/.../logs/train_gcm.log (GCM)  (set in Snakefile)
+
+executor: cluster-generic
+cluster-generic-submit-cmd:
+  "sbatch --job-name={rule} --time={resources.time} -c {resources.cpus}
+   -p {resources.partition} --gres=gpu:{resources.gpus} --mem={resources.mem_mb}M
+   --output=snake/logs/slurm_{rule}_%j.out
+   --error=snake/logs/slurm_{rule}_%j.err"
+
+jobs: 700
+# Use the greedy scheduler instead of the default ILP solver: at this sweep's
+# scale (tens of thousands of jobs) the ILP scheduler dominates the pre-execution
+# phase. Greedy is near-instant and fine for a homogeneous sweep like this.
+scheduler: greedy
+max-jobs-per-second: 5
+max-status-checks-per-second: 5
+latency-wait: 120
+rerun-incomplete: true
+rerun-triggers: [mtime]
+keep-going: true

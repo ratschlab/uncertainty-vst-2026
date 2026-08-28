@@ -1,0 +1,131 @@
+# snake_search/Snakefile
+#
+# Architecture random-search pipeline. Reuses src/ training code but is fully
+# separate from the classic and GCM Snakefiles.
+#
+# Flow:
+#   sample_configs.py (run ONCE by hand) -> configs_v2.json
+#   for each config_id: search_train (all folds, ONE job) -> per_config/{config_id}/result.json
+#   search_aggregate -> ranking.csv + best.json   (select on donor-CV VAL Pearson)
+#
+# Production setting:
+#   • MULTI-OUTPUT mean-only model over the 3000-HVG panel (out_dim = n_genes).
+#   • DONOR-grouped 5-fold GroupKFold over ALL donors (no test holdout). Grouping by
+#     SLIDE would leak. SELECTION CV only.
+#
+# PREREQUISITE: the preprocessed adata + its hvg/ lists must already exist
+# (produced by the main pipeline's `all_preprocess` for this dataset/preproc_id/
+# radius). This Snakefile only CONSUMES them.
+#
+# Run (profile carries submit-cmd / executor / job count, so worker SLURM logs
+# land in snake_search/logs/):
+#   python snake_search/scripts/sample_configs.py --n 500 --out snake_search/configs_v2.json
+#   snakemake -s snake_search/Snakefile --configfile snake_search/config.yaml \
+#       --profile snake_search/profile  search_all
+
+import json
+import os
+import subprocess
+
+configfile: "snake_search/config.yaml"
+
+# Activate the runtime env (mtenv0) inside every job's shell — the cluster submits
+# jobs from the `snaky` (Snakemake) env, which has no torch. Mirrors the classic /
+# GCM Snakefiles.
+CONDA_SH = os.environ.get("CONDA_SH") or os.path.join(
+    subprocess.run(["conda", "info", "--base"], capture_output=True, text=True,
+                   check=True).stdout.strip(),
+    "etc/profile.d/conda.sh",
+)
+if not os.path.isfile(CONDA_SH):
+    raise FileNotFoundError(f"conda.sh not found at {CONDA_SH}; set CONDA_SH to the conda profile script")
+
+CONDA_ACTIVATE = f'source "{CONDA_SH}" && conda activate mtenv0'
+shell.prefix(CONDA_ACTIVATE + " && ")
+
+CONFIGS_FILE = config["configs_file"]
+DATASET      = config["dataset"]
+PREPROC_ID   = config["preproc_id"]
+MODEL_TYPE   = config["model_type"]
+RADIUS       = str(config["radius"])
+SEARCH_ID    = config["search_id"]
+N_FOLDS      = int(config["n_folds"])
+CENTER       = int(bool(config.get("center", False)))
+DONOR_MAP    = config["donor_map"]
+PROJECT_ROOT = config["project_root"]
+
+# Radius dir tag: 0.75 -> r75 (value x100), matching snake/Snakefile's _r_tag.
+RADIUS_TAG = f"r{int(round(float(RADIUS) * 100))}"
+# Shared preprocessing outputs (consumed read-only).
+ADATA     = f"results/{DATASET}/_preprocessed/{PREPROC_ID}/{RADIUS_TAG}/adata.h5ad"
+GENE_LIST = (f"results/{DATASET}/_preprocessed/{PREPROC_ID}/{RADIUS_TAG}/hvg/"
+             f"{config['gene_list_basename']}")
+
+# Config ids come from the already-sampled configs file (must exist before running).
+if not os.path.exists(CONFIGS_FILE):
+    raise WorkflowError(
+        f"{CONFIGS_FILE} not found. Run sample_configs.py first:\n"
+        f"  python snake_search/scripts/sample_configs.py --n 500 --out {CONFIGS_FILE}"
+    )
+with open(CONFIGS_FILE) as f:
+    CONFIG_IDS = [c["config_id"] for c in json.load(f)["configs"]]
+
+# search_id segments the output so this search never clobbers the old one.
+OUT = f"results_search/{DATASET}/{MODEL_TYPE}/{SEARCH_ID}"
+
+
+rule search_all:
+    input:
+        f"{OUT}/ranking.csv",
+        f"{OUT}/best.json",
+
+
+# ONE job per config: loads the adata ONCE and loops over all N_FOLDS internally
+# (reusing the GPU-resident SharedTensors). Walltime covers all folds sequentially
+# (~2-3 min/fold for the mean-only model + a single ~1 min load).
+rule search_train:
+    input:
+        adata     = ADATA,
+        gene_list = GENE_LIST,
+    output:
+        result = f"{OUT}/per_config/{{config_id}}/result.json",
+    resources:
+        time      = "02:00:00",
+        cpus      = 5,
+        mem_mb    = 48000,         # read_arrays densifies the full inner-join panel (as production does)
+        gpus      = 1,
+        partition = "gpu",
+    log:
+        f"{OUT}/per_config/{{config_id}}/logs/train.log"
+    shell:
+        "python -u snake_search/scripts/search_train.py "
+        "--configs {CONFIGS_FILE} "
+        "--config-id {wildcards.config_id} "
+        "--n-folds {N_FOLDS} "
+        "--dataset {DATASET} "
+        "--model-type {MODEL_TYPE} "
+        "--project-root {PROJECT_ROOT} "
+        "--adata {input.adata} "
+        "--gene-list-file {input.gene_list} "
+        "--donor-map {DONOR_MAP} "
+        "--center {CENTER} "
+        "--out {output.result} "
+        "> {log} 2>&1"
+
+
+rule search_aggregate:
+    input:
+        expand(f"{OUT}/per_config/{{config_id}}/result.json", config_id=CONFIG_IDS),
+    output:
+        csv  = f"{OUT}/ranking.csv",
+        best = f"{OUT}/best.json",
+    resources:
+        time      = "00:10:00",
+        cpus      = 1,
+        mem_mb    = 4000,
+        gpus      = 0,
+        partition = "compute",
+    shell:
+        "python snake_search/scripts/search_aggregate.py "
+        "--results-glob '{OUT}/per_config/*/result.json' "
+        "--out-csv {output.csv} --out-best {output.best}"

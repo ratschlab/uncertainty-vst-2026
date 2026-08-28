@@ -1,0 +1,71 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+
+# Distribution / packaging
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.mypy_cache/
+
+# Environments, editors, notebooks
+.env
+.idea
+.vscode/
+.spyproject/
+.ipynb_checkpoints/
+.DS_Store
+*.swp
+*.swo
+
+# Run outputs. Every path here is written by a run and none of it is tracked:
+# results/ and results_gcm/ are the two pipelines' output trees, and .snakemake/
+# is Snakemake's own state. The logs/.gitkeep files are tracked so the
+# directories survive.
+results/
+results_gcm/
+snake_search/results_search/
+.snakemake/
+snake/logs/*
+!snake/logs/.gitkeep
+snake_search/logs/*
+!snake_search/logs/.gitkeep
+*.log
+
+# Inputs that are not redistributed here. The slide lists define the cohorts and
+# are small enough to ship; the patch embeddings, the gene embeddings and the
+# MSigDB gene sets are heavy or third-party, and their paths are set in
+# snake/config/config.yaml.
+/data/*
+!/data/slide_sample_list_*.txt
+patch_embeddings/
+
+# Local working files, outside the release: report/ is a link to the thesis
+# sources, and the two Claude entries are editor configuration.
+/report/
+.claude/
+CLAUDE.md

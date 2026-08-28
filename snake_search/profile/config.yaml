@@ -1,0 +1,38 @@
+# snake_search/profile/config.yaml
+#
+# Snakemake profile for the random-search pipeline. SINGLE SOURCE OF TRUTH for the
+# cluster submission command, so the per-worker SLURM logs ALWAYS land in
+# snake_search/logs/ — never snake/logs/, which belongs to the classic pipeline.
+#
+# Run (ad-hoc, single target — one config, all folds):
+#   snakemake -s snake_search/Snakefile --configfile snake_search/config.yaml \
+#       --profile snake_search/profile \
+#       results_search/10x_TuPro/msemeanonly/v2_donor_multiout_hvg3000/per_config/cfg000/result.json
+#
+# Run: pass --profile snake_search/profile to snakemake.
+#
+# ALL search logs live under snake_search/logs/ :
+#   • worker SLURM stdout/err  -> snake_search/logs/slurm_search_train_<jobid>.{out,err}
+#   • worker application log    -> results_search/.../per_config/<cfg>/logs/train.log
+
+executor: cluster-generic
+cluster-generic-submit-cmd:
+  "sbatch --job-name={rule} --time={resources.time} -c {resources.cpus}
+   -p {resources.partition} --gres=gpu:{resources.gpus} --mem={resources.mem_mb}M
+   --output=snake_search/logs/slurm_{rule}_%j.out
+   --error=snake_search/logs/slurm_{rule}_%j.err"
+
+# jobs MUST be >= the number of sampled configs so Snakemake submits EVERY
+# search_train job to the SLURM queue at once (no 100-at-a-time drip-feed). The
+# search_train jobs are mutually independent — only search_aggregate depends on
+# them — so SLURM queues all of them immediately and runs as many as GPUs free up.
+# 1000 covers any sane config count (256 now, up to 500 if you --append).
+jobs: 1000
+# Burst the submissions in fast (256 jobs -> ~30s) instead of 1/s (~4 min). Lower
+# this if the cluster's scheduler rejects rapid sbatch bursts.
+max-jobs-per-second: 10
+max-status-checks-per-second: 5
+latency-wait: 120
+rerun-incomplete: true
+rerun-triggers: [mtime]
+keep-going: true

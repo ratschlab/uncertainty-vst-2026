@@ -1,0 +1,5 @@
+# Shell scripts run on the Linux cluster: a CRLF line ending makes bash read "pipefail"
+# and abort with "set: invalid option name". Editing from Windows reintroduces CRLF on every
+# checkout unless this is pinned, so pin it.
+*.sh text eol=lf
+

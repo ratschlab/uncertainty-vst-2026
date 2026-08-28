@@ -1,0 +1,40 @@
+# The environment the README installs. It lists the packages the code imports and lets
+# conda pick the versions, so it solves against conda-forge alone. It installs a newer
+# stack than the one the reported results came from: pandas 3, numpy 2.5, pytorch 2.13
+# against pandas 2.3, numpy 2.2, pytorch 2.7.
+#
+# environment_mtenv0.yml is the full export of the environment those results were
+# produced in, pinned to exact versions. Install it instead to reproduce that stack.
+#
+# CONDA_OVERRIDE_CUDA=12.8 conda env create -f environment_mtenv0_minimal.yml
+#
+# The override is needed on a host with no NVIDIA driver, a login node for instance,
+# where the solve otherwise fails on "nothing provides __cuda".
+
+name: mtenv0
+channels:
+  - conda-forge
+  - nvidia
+dependencies:
+  - python=3.13
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - scikit-learn
+  - scikit-misc          # scanpy reads it for the seurat_v3 HVG selection
+  - scanpy
+  - anndata
+  - pyarrow              # the parquet reader behind pandas.read_parquet
+  - pyyaml
+  - pillow
+  - openjpeg
+  - umap-learn           # sc.tl.umap
+  - python-igraph        # sc.tl.leiden
+  - leidenalg            # sc.tl.leiden
+  - transformers         # the frozen patch encoder
+  - pytorch-gpu
+  - torchvision
+  - ipykernel
+  - notebook
+  - nbconvert

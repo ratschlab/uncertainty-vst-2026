@@ -1,0 +1,42 @@
+# snake_search/config.yaml
+#
+# Architecture random-search pipeline (classic, single-GPU). Independent of the
+# main snake/ pipeline but reuses the SAME src/ training code, so the architecture
+# it picks is the one the classic pipeline will actually train with.
+#
+# Goal: pick a defensible BASE ARCHITECTURE (+ a GPU-efficient batch/lr setting)
+# for the shared MLP backbone, by averaging each config's slide-aware VALIDATION
+# Pearson over the donor-grouped CV folds — IN THE PRODUCTION SETTING:
+#   • MULTI-OUTPUT mean-only model over the 3000-HVG panel (not single-gene).
+#   • DONOR-grouped 5-fold GroupKFold over ALL donors (no test holdout). Never by
+#     slide: two slides of one patient are near-duplicates, so that would leak.
+# This is SELECTION cross-validation; its val Pearson is a ranking signal, NOT a
+# reported generalization number (that comes from LOPO on the frozen pipeline).
+
+project_root: "/path/to/project/"
+configs_file: "snake_search/configs_v2.json"   # the sampled architectures, written by sample_configs.py
+
+# search_id segments the output dir, so two searches launched with different
+# settings never write into each other's results_search/ tree.
+search_id:  "v2_donor_multiout_hvg3000"
+
+# ── What to search on ─────────────────────────────────────────────────────────
+dataset:    "10x_TuPro"      # SELECT on the highest-quality dataset (least-noisy signal)
+preproc_id: "v5"             # production preprocessing version
+radius:     "0.75"
+model_type: "msemeanonly"    # the model the search tunes (MSE mean-only proxy backbone)
+
+# Multi-output target panel: the production HVG-top3000 list for this dataset,
+# resolved relative to project_root in the Snakefile from preproc_id/radius.
+gene_list_basename: "hvg_top3000.txt"
+
+# Donor->slide map (leakage-safe CV grouping). Absent dataset => donor == slide.
+donor_map:  "snake/config/donor_slide_map.yaml"
+
+# Donor-grouped CV over ALL donors (selection only). TuPro has 7 donors -> 5-fold OK.
+n_folds:    5
+
+# Center embeddings by the train-fold mean? Kept equal to the classic config's
+# `centering_from_train` so the search is representative of how models are trained.
+# (Pearson is shift/scale-invariant per gene, so this mainly affects optimization.)
+center:     false
