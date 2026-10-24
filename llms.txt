@@ -1,0 +1,57 @@
+# uncertainty-vst-2026
+
+> Code for "Probabilistic uncertainty in virtual spatial transcriptomics from histology is largely redundant with the predicted mean" (Batique, Nonchev, Koelzer and Rätsch, bioRxiv 2026). A systematic benchmark of aleatoric and epistemic uncertainty for spot-level gene expression predicted from H&E histology images on 10x Visium spatial transcriptomics.
+
+## Key Facts
+
+- Benchmarks predictive uncertainty for virtual spatial transcriptomics, i.e. gene expression predicted from H&E histology
+- Three 10x Visium cancer cohorts, 60 sections: metastatic melanoma (Tumor Profiler), kidney and lung tumors with tertiary lymphoid structures (TLS), and non-small cell lung cancer (NSCLC); 3,000 highly variable genes; leave-one-patient-out cross-validation
+- Frozen H&E encoder: Midnight (kaiko-ai/midnight); an MLP maps patch embeddings to the parameters of a predictive distribution
+- Aleatoric uncertainty: Gaussian (heteroscedastic, gene- and spot-homoscedastic, beta-NLL), Poisson and negative binomial heads, plus the STimage readout
+- Epistemic uncertainty: deep ensembles, MC dropout, last-layer Laplace approximation
+- Baselines: a histology-free per-gene marginal, a training-free kNN neighborhood signal, an error oracle
+- Evaluation: PIT calibration, and error informativeness via partial Spearman correlation controlling for the predicted mean and sparsification curves against the oracle; computed per (slide, gene), then averaged
+- Main finding: uncertainty is associated with prediction error, but the predicted mean largely explains that association; after accounting for the mean, uncertainty carries only weak information about larger errors. Good calibration does not imply informative uncertainty: simple distributions fitted without histology are calibrated too
+- Snakemake pipeline (SLURM profile), PyTorch, MIT licensed
+
+## When to Use This Repository
+
+- You want to check whether the uncertainty of your own histology-to-gene-expression model is calibrated and informative beyond its predicted mean: `notebooks/reproducing_the_numbers_on_any_predictions.ipynb` computes every metric of the paper from any predictions
+- You need implementations of PIT calibration, partial Spearman informativeness or sparsification curves for spatial transcriptomics (`src/evaluation/`)
+- You want to reproduce the benchmark of the paper
+
+## Related Projects
+
+- [DeepSpot](https://github.com/ratschlab/DeepSpot): Predicts spatial transcriptomics from H&E images, at spot-level (Visium) and single-cell (Xenium) resolution
+- [DeepSpot-M](https://github.com/ratschlab/DeepSpotM): Multimodal foundation model for transcriptome-wide virtual spatial transcriptomics from histology
+- [DeepSpot2Cell](https://github.com/ratschlab/DeepSpot2Cell): Predicts virtual single-cell spatial transcriptomics from H&E images
+- [Aurora](https://www.auroraomics.org): No-code platform for virtual spatial transcriptomics from H&E images
+
+## Links
+
+- Repository: https://github.com/ratschlab/uncertainty-vst-2026
+- Preprint: https://www.biorxiv.org/content/10.64898/2026.10.23.760875v1
+- DOI: https://doi.org/10.64898/2026.10.23.760875
+
+## Installation
+
+```
+git clone https://github.com/ratschlab/uncertainty-vst-2026
+cd uncertainty-vst-2026
+conda env create -f environment_mtenv0_minimal.yml
+conda activate mtenv0
+pip install -e .
+```
+
+## Quick Start
+
+Set the `/path/to/...` placeholders in `snake/config/config.yaml`, then run the main sweep:
+
+```
+snakemake --snakefile snake/Snakefile --configfile snake/config/config.yaml \
+  --profile snake/profile all_classic
+```
+
+## Citation
+
+Batique, T., Nonchev, K., Koelzer, V.H. and Rätsch, G. (2026). Probabilistic uncertainty in virtual spatial transcriptomics from histology is largely redundant with the predicted mean. bioRxiv. DOI: 10.64898/2026.10.23.760875
