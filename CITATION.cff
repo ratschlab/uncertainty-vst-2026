@@ -1,0 +1,63 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the preprint below."
+title: "uncertainty-vst: benchmarking predictive uncertainty in virtual spatial transcriptomics"
+abstract: >-
+  Code for "Probabilistic uncertainty in virtual spatial transcriptomics from histology
+  is largely redundant with the predicted mean". A systematic benchmark of aleatoric and
+  epistemic uncertainty for gene expression predicted from H&E histology on 10x Visium
+  spatial transcriptomics, across three cancer cohorts (melanoma, lung, kidney). Compares
+  probabilistic likelihood heads (Gaussian, Poisson, negative binomial), deep ensembles,
+  MC dropout and last-layer Laplace against histology-free and training-free baselines,
+  and scores each predictive distribution for calibration and for error informativeness
+  beyond the predicted mean.
+type: software
+license: MIT
+authors:
+  - family-names: Batique
+    given-names: Thomas
+  - family-names: Nonchev
+    given-names: Kalin
+    orcid: "https://orcid.org/0009-0001-4904-8772"
+  - family-names: Koelzer
+    given-names: Viktor H
+  - family-names: Raetsch
+    given-names: Gunnar
+repository-code: "https://github.com/ratschlab/uncertainty-vst-2026"
+url: "https://www.biorxiv.org/content/10.64898/2026.10.23.760875v1"
+keywords:
+  - virtual spatial transcriptomics
+  - spatial transcriptomics
+  - gene expression prediction from histology
+  - H&E histology
+  - computational pathology
+  - uncertainty quantification
+  - aleatoric uncertainty
+  - epistemic uncertainty
+  - calibration
+  - deep ensembles
+  - MC dropout
+  - Laplace approximation
+  - benchmark
+  - 10x Visium
+  - melanoma
+  - lung cancer
+  - kidney cancer
+preferred-citation:
+  type: article
+  title: "Probabilistic uncertainty in virtual spatial transcriptomics from histology is largely redundant with the predicted mean"
+  authors:
+    - family-names: Batique
+      given-names: Thomas
+    - family-names: Nonchev
+      given-names: Kalin
+      orcid: "https://orcid.org/0009-0001-4904-8772"
+    - family-names: Koelzer
+      given-names: Viktor H
+    - family-names: Raetsch
+      given-names: Gunnar
+  journal: bioRxiv
+  publisher:
+    name: Cold Spring Harbor Laboratory
+  year: 2026
+  doi: "10.64898/2026.10.23.760875"
+  url: "https://www.biorxiv.org/content/10.64898/2026.10.23.760875v1"

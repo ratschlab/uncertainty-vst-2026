@@ -1,10 +1,22 @@
 # Uncertainty in virtual spatial transcriptomics
 
-Code for *"Probabilistic uncertainty in virtual spatial transcriptomics from histology is largely redundant with the predicted mean"*: a benchmark of predictive uncertainty for gene expression predicted from H&E, on three Visium cancer cohorts (Tumor Profiler, Kidney/Lung TLS, NSCLC), under leave-one-patient-out training.
+Code for [*Probabilistic uncertainty in virtual spatial transcriptomics from histology is largely redundant with the predicted mean*](https://doi.org/10.64898/2026.10.23.760875) (Batique, Nonchev, Koelzer and Rätsch, bioRxiv 2026): a benchmark of predictive uncertainty for gene expression predicted from H&E, on three Visium cancer cohorts (Tumor Profiler, Kidney/Lung TLS, NSCLC), under leave-one-patient-out training.
+
+Deep learning has enabled virtual spatial transcriptomics from histology, offering a scalable approach to molecular profiling of routinely archived tissue without molecular assays. However, reliable uncertainty estimates are essential for identifying potentially inaccurate predictions, and it remains unclear whether existing methods provide useful information about prediction reliability. Here, we present a systematic benchmark of uncertainty estimation for virtual spatial transcriptomics across three cancer cohorts spanning melanoma, lung, and kidney tumors. We evaluate aleatoric and epistemic uncertainty using probabilistic likelihoods and approximate Bayesian methods alongside histology-free and training-free baselines, assessing both calibration and error informativeness. Across cohorts and methods, uncertainty is associated with prediction error, but the predicted mean largely explains this association. After accounting for the mean, uncertainty provides only weak information about larger errors. Moreover, good calibration does not imply informative uncertainty, with simple distributions fitted without histology achieving comparable calibration. We therefore distinguish calibrated from informative uncertainty and argue that uncertainty should provide information about prediction error beyond the predicted mean. This benchmark provides a framework for systematic uncertainty evaluation in virtual spatial transcriptomics.
+
+**At a glance**
+
+- **Question:** does the predicted uncertainty of a histology-to-gene-expression model tell us which predictions are wrong, beyond what the predicted mean already tells us?
+- **Task:** predict spot-level gene expression (3,000 highly variable genes) from H&E patches. **Histology model:** Midnight, frozen.
+- **Data:** 60 10x Genomics Visium sections from three cancer cohorts: metastatic melanoma (Tumor Profiler), kidney and lung tumors with tertiary lymphoid structures, and non-small cell lung cancer (NSCLC).
+- **Uncertainty methods:** Gaussian, Poisson and negative binomial likelihood heads, STimage, deep ensembles, MC dropout, last-layer Laplace, and histology-free (per-gene marginal) and training-free (kNN neighborhood) baselines.
+- **Evaluation:** PIT calibration; error informativeness via partial Spearman correlation controlling for the predicted mean, and sparsification curves against an error oracle; leave-one-patient-out cross-validation.
+
+**Keywords:** virtual spatial transcriptomics, spatial transcriptomics, gene expression prediction from histology, H&E histology, computational pathology, uncertainty quantification, aleatoric uncertainty, epistemic uncertainty, calibration, probability integral transform (PIT), deep ensembles, MC dropout, Laplace approximation, heteroscedastic regression, negative binomial, beta-NLL, benchmark, 10x Visium, melanoma, lung cancer, kidney cancer, Midnight, STimage.
 
 
 ## Overview
-![Overview of the benchmark](figures/fig_overview.png)
+![Overview of the benchmark: frozen H&E patch embeddings feed an MLP that predicts a distribution over each spot's gene expression; aleatoric, epistemic and kNN neighborhood uncertainties are then scored for calibration and for informativeness beyond the predicted mean.](figures/fig_overview.png)
 
 *Graphical abstract: An MLP maps frozen H&E patch embeddings to the parameters of a predictive distribution. The aleatoric spread comes from the head, the epistemic spread from three epistemic estimators. A training-free neighborhood signal bypasses the model. We assess calibration and usefulness.*
 
@@ -175,3 +187,22 @@ The metrics do not depend on the models here. Given predictions from any source,
 
 Throughout here, everything is computed per (slide, gene) first, then averaged. Pooling every spot of every slide into one correlation lets the differences between slides carry the score. The aggregation logic is specified at the end of the notebook. 
 
+
+## Citation
+
+If you use this code, please cite the
+[preprint](https://www.biorxiv.org/content/10.64898/2026.10.23.760875v1):
+
+```bibtex
+@article{batique2026probabilistic,
+  title={Probabilistic uncertainty in virtual spatial transcriptomics from histology is largely redundant with the predicted mean},
+  author={Batique, Thomas and Nonchev, Kalin and Koelzer, Viktor H and Raetsch, Gunnar},
+  journal={bioRxiv},
+  pages={2026--10},
+  year={2026},
+  doi={10.64898/2026.10.23.760875},
+  publisher={Cold Spring Harbor Laboratory}
+}
+```
+
+Per-cohort citations and accessions are in the table of section 2 above.
