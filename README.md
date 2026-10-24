@@ -1,6 +1,22 @@
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/downloads/)
+[![bioRxiv](https://img.shields.io/badge/bioRxiv-2026.10.23.760875-blue)](https://www.biorxiv.org/content/10.64898/2026.10.23.760875v1)
+
 # Uncertainty in virtual spatial transcriptomics
 
-Code for [*Probabilistic uncertainty in virtual spatial transcriptomics from histology is largely redundant with the predicted mean*](https://doi.org/10.64898/2026.10.23.760875) (Batique, Nonchev, Koelzer and Rätsch, bioRxiv 2026): a benchmark of predictive uncertainty for gene expression predicted from H&E, on three Visium cancer cohorts (Tumor Profiler, Kidney/Lung TLS, NSCLC), under leave-one-patient-out training.
+This repository contains the code of the paper "[Probabilistic uncertainty in virtual spatial transcriptomics from histology is largely redundant with the predicted mean](https://doi.org/10.64898/2026.10.23.760875)": a benchmark of predictive uncertainty for gene expression predicted from H&E, on three Visium cancer cohorts (Tumor Profiler, Kidney/Lung TLS, NSCLC), under leave-one-patient-out training.
+
+**Authors**: Thomas Batique, Kalin Nonchev, Viktor Hendrik Koelzer, and Gunnar Rätsch
+
+The preprint is available [here](https://www.biorxiv.org/content/10.64898/2026.10.23.760875v1).
+
+## News
+
+  - [10.2026] [Probabilistic uncertainty in virtual spatial transcriptomics from histology is largely redundant with the predicted mean](https://www.biorxiv.org/content/10.64898/2026.10.23.760875v1) is available on bioRxiv.
+  - [09.2026] Introducing [Aurora](https://www.auroraomics.org) - a no-code platform for virtual spatial transcriptomics from H&E images. Aurora makes virtual spatial transcriptomics accessible without requiring users to have their own GPUs, with a fully automated workflow designed to ensure that spatial transcriptomics predictions are performed correctly. Try the interactive [Aurora demo](https://www.auroraomics.org/demo).
+  - [06.2026] New generation model [DeepSpot-M: a multimodal foundation model for transcriptome-wide virtual spatial transcriptomics from histology](https://www.medrxiv.org/content/10.64898/2026.06.19.26356060v1). [Code.](https://github.com/ratschlab/DeepSpotM)
+
+## Does predicted uncertainty tell us when virtual spatial transcriptomics is wrong?
 
 Deep learning has enabled virtual spatial transcriptomics from histology, offering a scalable approach to molecular profiling of routinely archived tissue without molecular assays. However, reliable uncertainty estimates are essential for identifying potentially inaccurate predictions, and it remains unclear whether existing methods provide useful information about prediction reliability. Here, we present a systematic benchmark of uncertainty estimation for virtual spatial transcriptomics across three cancer cohorts spanning melanoma, lung, and kidney tumors. We evaluate aleatoric and epistemic uncertainty using probabilistic likelihoods and approximate Bayesian methods alongside histology-free and training-free baselines, assessing both calibration and error informativeness. Across cohorts and methods, uncertainty is associated with prediction error, but the predicted mean largely explains this association. After accounting for the mean, uncertainty provides only weak information about larger errors. Moreover, good calibration does not imply informative uncertainty, with simple distributions fitted without histology achieving comparable calibration. We therefore distinguish calibrated from informative uncertainty and argue that uncertainty should provide information about prediction error beyond the predicted mean. This benchmark provides a framework for systematic uncertainty evaluation in virtual spatial transcriptomics.
 
@@ -190,13 +206,12 @@ Throughout here, everything is computed per (slide, gene) first, then averaged. 
 
 ## Citation
 
-If you use this code, please cite the
-[preprint](https://www.biorxiv.org/content/10.64898/2026.10.23.760875v1):
+In case you found our work useful, please consider citing us:
 
 ```bibtex
 @article{batique2026probabilistic,
   title={Probabilistic uncertainty in virtual spatial transcriptomics from histology is largely redundant with the predicted mean},
-  author={Batique, Thomas and Nonchev, Kalin and Koelzer, Viktor H and Raetsch, Gunnar},
+  author={Batique, Thomas and Nonchev, Kalin and Koelzer, Viktor H and R{\"a}tsch, Gunnar},
   journal={bioRxiv},
   pages={2026--10},
   year={2026},
@@ -206,3 +221,7 @@ If you use this code, please cite the
 ```
 
 Per-cohort citations and accessions are in the table of section 2 above.
+
+## Contact
+
+In case you have questions, please get in touch with [Kalin Nonchev](https://bmi.inf.ethz.ch/people/person/kalin-nonchev).

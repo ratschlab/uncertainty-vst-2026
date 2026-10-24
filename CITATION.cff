@@ -1,6 +1,7 @@
 cff-version: 1.2.0
-message: "If you use this code, please cite the preprint below."
 title: "uncertainty-vst: benchmarking predictive uncertainty in virtual spatial transcriptomics"
+message: "If you use this code, please cite it using the metadata from this file."
+type: software
 abstract: >-
   Code for "Probabilistic uncertainty in virtual spatial transcriptomics from histology
   is largely redundant with the predicted mean". A systematic benchmark of aleatoric and
@@ -10,54 +11,61 @@ abstract: >-
   MC dropout and last-layer Laplace against histology-free and training-free baselines,
   and scores each predictive distribution for calibration and for error informativeness
   beyond the predicted mean.
-type: software
-license: MIT
 authors:
-  - family-names: Batique
-    given-names: Thomas
-  - family-names: Nonchev
-    given-names: Kalin
-    orcid: "https://orcid.org/0009-0001-4904-8772"
-  - family-names: Koelzer
-    given-names: Viktor H
-  - family-names: Raetsch
-    given-names: Gunnar
-repository-code: "https://github.com/ratschlab/uncertainty-vst-2026"
-url: "https://www.biorxiv.org/content/10.64898/2026.10.23.760875v1"
+  - given-names: Thomas
+    family-names: Batique
+  - given-names: Kalin
+    family-names: Nonchev
+    orcid: https://orcid.org/0009-0001-4904-8772
+  - given-names: Viktor Hendrik
+    family-names: Koelzer
+  - given-names: Gunnar
+    family-names: Rätsch
+repository-code: https://github.com/ratschlab/uncertainty-vst-2026
+url: https://doi.org/10.64898/2026.10.23.760875
+license: MIT
+version: 0.1.0
+date-released: "2026-10-24"
 keywords:
-  - virtual spatial transcriptomics
-  - spatial transcriptomics
-  - gene expression prediction from histology
-  - H&E histology
-  - computational pathology
-  - uncertainty quantification
-  - aleatoric uncertainty
-  - epistemic uncertainty
+  - virtual-spatial-transcriptomics
+  - spatial-transcriptomics
+  - gene-expression-prediction
+  - uncertainty-quantification
+  - aleatoric-uncertainty
+  - epistemic-uncertainty
   - calibration
-  - deep ensembles
-  - MC dropout
-  - Laplace approximation
+  - deep-ensembles
+  - mc-dropout
+  - laplace-approximation
   - benchmark
-  - 10x Visium
-  - melanoma
-  - lung cancer
-  - kidney cancer
+  - computational-pathology
+  - digital-pathology
+  - histopathology
+  - visium
+  - deep-learning
+  - pytorch
+  - bioinformatics
+identifiers:
+  - type: doi
+    value: 10.64898/2026.10.23.760875
+    description: bioRxiv preprint
 preferred-citation:
   type: article
   title: "Probabilistic uncertainty in virtual spatial transcriptomics from histology is largely redundant with the predicted mean"
   authors:
-    - family-names: Batique
-      given-names: Thomas
-    - family-names: Nonchev
-      given-names: Kalin
-      orcid: "https://orcid.org/0009-0001-4904-8772"
-    - family-names: Koelzer
-      given-names: Viktor H
-    - family-names: Raetsch
-      given-names: Gunnar
+    - given-names: Thomas
+      family-names: Batique
+    - given-names: Kalin
+      family-names: Nonchev
+      orcid: https://orcid.org/0009-0001-4904-8772
+    - given-names: Viktor Hendrik
+      family-names: Koelzer
+    - given-names: Gunnar
+      family-names: Rätsch
+  doi: 10.64898/2026.10.23.760875
+  url: https://www.biorxiv.org/content/10.64898/2026.10.23.760875v1
   journal: bioRxiv
+  year: 2026
+  month: 10
   publisher:
     name: Cold Spring Harbor Laboratory
-  year: 2026
-  doi: "10.64898/2026.10.23.760875"
-  url: "https://www.biorxiv.org/content/10.64898/2026.10.23.760875v1"
